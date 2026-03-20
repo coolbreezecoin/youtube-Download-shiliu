@@ -61,6 +61,114 @@ npm run tauri build
 - `src-tauri/target/release/bundle/macos/拾流下载器.app`
 - `src-tauri/target/release/bundle/dmg/拾流下载器_0.1.1_aarch64.dmg`
 
+## 正式发布 macOS 安装包
+
+如果你要发给普通用户使用，不能直接分发默认的本地构建包。  
+你需要使用 `Developer ID Application` 证书签名，并通过 Apple notarization 公证，否则用户机器上可能会看到“已损坏，无法打开”。
+
+这个仓库已经提供了自动化脚本：
+
+```bash
+scripts/build-macos-notarized.sh
+```
+
+使用前先准备这些环境变量：
+
+```bash
+export APPLE_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)'
+export APPLE_API_ISSUER='xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+export APPLE_API_KEY='XXXXXXXXXX'
+export APPLE_API_KEY_PATH='/absolute/path/to/AuthKey_XXXXXXXXXX.p8'
+```
+
+然后执行：
+
+```bash
+./scripts/build-macos-notarized.sh
+```
+
+脚本会自动完成：
+
+- 在非 `Desktop` 路径的临时目录构建，绕开 `com.apple.macl` 导致的签名失败
+- 调用 Tauri 先完成基础签名
+- 对 `ffmpeg-libs` 里的 `.dylib` 逐个补签
+- 重新签名 `.app`
+- 提交 `.app` 到 Apple notarization
+- `staple` 公证票据
+- 生成并再次公证 `.dmg`
+- 把最终产物输出到 `release-artifacts/`
+
+最终可分发产物会在：
+
+- `release-artifacts/拾流下载器.app`
+- `release-artifacts/拾流下载器_0.1.1_aarch64_notarized.dmg`
+
+## GitHub Actions 自动发布
+
+仓库已经包含工作流：
+
+- `.github/workflows/macos-release.yml`
+
+支持两种触发方式：
+
+- 手动在 GitHub Actions 页面点 `Run workflow`
+- 推送 tag，例如：
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+工作流会自动完成：
+
+- 导入 `Developer ID Application` 证书
+- 写入 `App Store Connect API Key`
+- 构建 `.app`
+- 补签 `ffmpeg-libs` 里的 `.dylib`
+- notarize `.app`
+- 打包并 notarize `.dmg`
+- 上传 `.dmg` 和 `.app.zip`
+- 如果是 tag 触发，还会自动创建 GitHub Release
+
+### 需要配置的 GitHub Secrets
+
+进入仓库：
+
+`Settings` -> `Secrets and variables` -> `Actions`
+
+添加这些 secrets：
+
+- `APPLE_SIGNING_IDENTITY`
+  例如：`Developer ID Application: Liangfeng Wang (YF23S68C4U)`
+- `APPLE_API_ISSUER`
+  你的 `Issuer ID`
+- `APPLE_API_KEY`
+  你的 `Key ID`
+- `APPLE_API_KEY_P8`
+  `AuthKey_XXXXXX.p8` 文件内容全文
+- `APPLE_CERTIFICATE_P12`
+  `Developer ID Application` 证书导出的 `.p12` 文件内容，先转成 base64 再填
+- `APPLE_CERTIFICATE_PASSWORD`
+  导出 `.p12` 时设置的密码
+- `KEYCHAIN_PASSWORD`
+  GitHub Actions 临时 keychain 的密码，自己随便设一个高强度字符串
+
+### 导出 `.p12` 证书
+
+在 `钥匙串访问` 中找到：
+
+- `Developer ID Application: ...`
+
+右键导出为 `.p12`，并设置一个导出密码。
+
+然后把它转成 base64：
+
+```bash
+base64 -i developer-id.p12 | pbcopy
+```
+
+再把剪贴板内容填进 `APPLE_CERTIFICATE_P12`。
+
 ## 内置依赖
 
 打包产物已内置以下可执行文件：

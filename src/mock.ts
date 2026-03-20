@@ -1,8 +1,8 @@
 import type { EnvironmentSnapshot, HistoryItem, SettingsGroup } from "./types";
 
 export const fallbackEnvironment: EnvironmentSnapshot = {
-  recommendedOutputDir: "~/Downloads/ytDownloader",
-  note: "当前为界面预览模式。进入 Tauri 窗口后会自动检测 yt-dlp、ffmpeg 和 JavaScript runtime。",
+  recommendedOutputDir: "~/Downloads/拾流下载器",
+  note: "当前为界面预览模式。进入拾流下载器桌面窗口后会自动检测 yt-dlp、ffmpeg 和 JavaScript runtime。",
   installerAvailable: false,
   installerName: null,
   checks: [
@@ -37,7 +37,8 @@ export const fallbackEnvironment: EnvironmentSnapshot = {
       required: false,
       autoInstallAvailable: false,
       autoInstallLabel: null,
-      manualInstallHint: "建议安装 Node.js，或从官网安装任意受支持的 JavaScript runtime。",
+      manualInstallHint:
+        "建议安装 Bun：brew tap oven-sh/bun && brew install oven-sh/bun/bun。",
     },
   ],
 };
@@ -47,19 +48,19 @@ export const historyData: HistoryItem[] = [
     title: "Weekly Design Review - MP3",
     finishedAt: "2026-03-15 19:42",
     profile: "仅音频 / m4a -> mp3",
-    output: "~/Downloads/ytDownloader/Audio",
+    output: "~/Downloads/拾流下载器/Audio",
   },
   {
     title: "Frontend Toolkit Playlist",
     finishedAt: "2026-03-15 10:18",
     profile: "播放列表 / 1080p / 字幕",
-    output: "~/Downloads/ytDownloader/Playlists",
+    output: "~/Downloads/拾流下载器/Playlists",
   },
   {
     title: "Interview Archive",
     finishedAt: "2026-03-14 23:09",
     profile: "最佳质量 / 嵌入封面",
-    output: "~/Downloads/ytDownloader/Archive",
+    output: "~/Downloads/拾流下载器/Archive",
   },
 ];
 
@@ -70,7 +71,7 @@ export const settingsGroups: SettingsGroup[] = [
     items: [
       { label: "默认模式", value: "视频" },
       { label: "质量策略", value: "平衡质量" },
-      { label: "保存目录", value: "~/Downloads/ytDownloader" },
+      { label: "保存目录", value: "~/Downloads/拾流下载器" },
     ],
   },
   {

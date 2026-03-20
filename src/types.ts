@@ -1,5 +1,7 @@
 export type AppView = "download" | "tasks" | "history" | "settings";
 
+export type AppLanguage = "zh-CN" | "en-US";
+
 export type DownloadMode = "video" | "audio" | "subtitles" | "video+subtitles";
 
 export type QualityPreset = "best" | "balanced" | "compact";
@@ -45,8 +47,18 @@ export interface EnvironmentSnapshot {
   installerName: string | null;
 }
 
+export interface InstallProgress {
+  status: "running" | "done" | "failed";
+  progress: number;
+  currentFormula: string | null;
+  currentStep: number;
+  totalSteps: number;
+  message: string;
+}
+
 export interface PreviewFormat {
   formatId: string;
+  downloadSelector: string;
   label: string;
   detail: string;
   size: string;
@@ -63,6 +75,7 @@ export interface PlaylistEntry {
   index: number;
   title: string;
   duration: string;
+  sourceUrl: string;
 }
 
 export interface MediaPreview {
@@ -102,14 +115,17 @@ export interface AuthPayload {
 export interface ParseUrlPayload extends AuthPayload {
   url: string;
   playlistScope: PlaylistScope;
+  language: AppLanguage;
 }
 
 export interface StartDownloadPayload extends AuthPayload {
   url: string;
+  title?: string | null;
   mode: DownloadMode;
   formatId: string | null;
   outputDir: string;
   playlistScope: PlaylistScope;
+  language: AppLanguage;
 }
 
 export interface HistoryItem {
@@ -117,6 +133,16 @@ export interface HistoryItem {
   finishedAt: string;
   profile: string;
   output: string;
+}
+
+export interface AppSettings {
+  outputDir: string;
+  defaultDownloadMode: DownloadMode;
+  defaultPlaylistScope: PlaylistScope;
+  defaultAuthMode: AuthMode;
+  defaultBrowser: CookieBrowser;
+  defaultCookieFile: string;
+  language: AppLanguage;
 }
 
 export interface SettingsGroup {

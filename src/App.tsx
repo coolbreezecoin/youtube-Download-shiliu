@@ -1,101 +1,119 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { startTransition, useEffect, useState } from "react";
 import "./App.css";
-import { fallbackEnvironment, historyData, settingsGroups } from "./mock";
+import {
+  authOptionsFor,
+  browserOptionsFor,
+  copyFor,
+  modeOptionsFor,
+  scopeOptionsFor,
+  statusLabelFor,
+} from "./i18n";
+import { fallbackEnvironment } from "./mock";
 import type {
   AppView,
+  AppLanguage,
+  AppSettings,
   AuthMode,
   CookieBrowser,
   DownloadMode,
   DownloadTask,
-  EnvironmentCheck,
-  EnvironmentSnapshot,
+  HistoryItem,
   MediaPreview,
   ParseUrlPayload,
+  PlaylistEntry,
   PlaylistScope,
   StartDownloadPayload,
   TaskStatus,
 } from "./types";
 
-const modeOptions: Array<{ value: DownloadMode; label: string; hint: string }> = [
-  { value: "video", label: "视频", hint: "下载所选媒体格式" },
-  { value: "audio", label: "音频", hint: "对所选源格式提取音频" },
-  { value: "subtitles", label: "字幕", hint: "只下载字幕，不下载媒体" },
-  { value: "video+subtitles", label: "视频 + 字幕", hint: "下载媒体并附带字幕" },
-];
-
-const authOptions: Array<{ value: AuthMode; label: string; hint: string }> = [
-  { value: "none", label: "不使用 Cookie", hint: "适合公开可下载内容" },
-  { value: "browser", label: "从浏览器读取", hint: "适合 YouTube 登录态场景" },
-  { value: "file", label: "导入 Cookie 文件", hint: "适合 Netscape 格式文件" },
-];
-
-const browserOptions: Array<{ value: CookieBrowser; label: string }> = [
-  { value: "chrome", label: "Chrome" },
-  { value: "chromium", label: "Chromium" },
-  { value: "edge", label: "Edge" },
-  { value: "firefox", label: "Firefox" },
-  { value: "safari", label: "Safari" },
-  { value: "brave", label: "Brave" },
-  { value: "opera", label: "Opera" },
-  { value: "vivaldi", label: "Vivaldi" },
-  { value: "whale", label: "Whale" },
-];
-
-const playlistScopeOptions: Array<{
-  value: PlaylistScope;
-  label: string;
-  hint: string;
-}> = [
-  { value: "video", label: "当前视频", hint: "优先只解析并下载当前播放的视频" },
-  { value: "playlist", label: "整个播放列表", hint: "按列表容器解析和下载" },
-];
-
 function App() {
+  const [settings, setSettings] = useState<AppSettings>(buildDefaultSettings());
+  const [savedSettings, setSavedSettings] = useState<AppSettings>(buildDefaultSettings());
   const [activeView, setActiveView] = useState<AppView>("download");
   const [downloadMode, setDownloadMode] = useState<DownloadMode>("video");
   const [playlistScope, setPlaylistScope] = useState<PlaylistScope>("video");
   const [authMode, setAuthMode] = useState<AuthMode>("none");
+  const [authModeTouched, setAuthModeTouched] = useState(false);
   const [browser, setBrowser] = useState<CookieBrowser>("chrome");
   const [cookieFile, setCookieFile] = useState("");
   const [urlInput, setUrlInput] = useState("");
   const [saveDirectory, setSaveDirectory] = useState(
     fallbackEnvironment.recommendedOutputDir,
   );
-  const [environment, setEnvironment] =
-    useState<EnvironmentSnapshot>(fallbackEnvironment);
   const [preview, setPreview] = useState<MediaPreview | null>(null);
   const [selectedFormatId, setSelectedFormatId] = useState<string | null>(null);
+  const [selectedPlaylistEntryIndex, setSelectedPlaylistEntryIndex] = useState<number | null>(
+    null,
+  );
+  const [playlistEntryPreviews, setPlaylistEntryPreviews] = useState<
+    Record<number, MediaPreview>
+  >({});
+  const [playlistEntrySelections, setPlaylistEntrySelections] = useState<
+    Record<number, string>
+  >({});
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isParsing, setIsParsing] = useState(false);
   const [isStartingDownload, setIsStartingDownload] = useState(false);
-  const [isInstallingAll, setIsInstallingAll] = useState(false);
+  const [isLoadingPlaylistEntry, setIsLoadingPlaylistEntry] = useState(false);
   const [parseError, setParseError] = useState("");
   const [downloadError, setDownloadError] = useState("");
-  const [installError, setInstallError] = useState("");
+  const [playlistEntryError, setPlaylistEntryError] = useState("");
+  const [settingsError, setSettingsError] = useState("");
+  const [settingsMessage, setSettingsMessage] = useState("");
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const language = settings.language;
+  const copy = copyFor(language);
+  const modeOptions = modeOptionsFor(language);
+  const authOptions = authOptionsFor(language);
+  const browserOptions = browserOptionsFor(language);
+  const playlistScopeOptions = scopeOptionsFor(language);
 
   useEffect(() => {
     let mounted = true;
 
     async function loadInitialState() {
       try {
-        const [snapshot, existingTasks] = await Promise.all([
-          invoke<EnvironmentSnapshot>("detect_environment"),
+        const [existingTasks, existingHistory, persistedSettings] = await Promise.all([
           invoke<DownloadTask[]>("get_tasks"),
+          invoke<HistoryItem[]>("get_history"),
+          invoke<AppSettings>("get_settings"),
         ]);
 
         if (!mounted) {
           return;
         }
 
-        setEnvironment(snapshot);
-        setSaveDirectory(snapshot.recommendedOutputDir);
+        setSettings(persistedSettings);
+        setSavedSettings(persistedSettings);
+        setDownloadMode(persistedSettings.defaultDownloadMode);
+        setPlaylistScope(persistedSettings.defaultPlaylistScope);
+        setAuthMode(preferredAuthModeForUrl("", persistedSettings.defaultAuthMode));
+        setAuthModeTouched(false);
+        setBrowser(persistedSettings.defaultBrowser);
+        setCookieFile(persistedSettings.defaultCookieFile);
+        setSaveDirectory(persistedSettings.outputDir);
         setTasks(existingTasks);
+        setHistory(existingHistory);
       } catch {
-        if (mounted) {
-          setEnvironment(fallbackEnvironment);
+        if (!mounted) {
+          return;
         }
+
+        const defaults = buildDefaultSettings();
+        setSettings(defaults);
+        setSavedSettings(defaults);
+        setDownloadMode(defaults.defaultDownloadMode);
+        setPlaylistScope(defaults.defaultPlaylistScope);
+        setAuthMode(preferredAuthModeForUrl("", defaults.defaultAuthMode));
+        setAuthModeTouched(false);
+        setBrowser(defaults.defaultBrowser);
+        setCookieFile(defaults.defaultCookieFile);
+        setSaveDirectory(defaults.outputDir);
+        setHistory([]);
       }
     }
 
@@ -108,15 +126,34 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let cleanup: (() => void) | undefined;
+    let cleanupTaskEvents: (() => void) | undefined;
+    let cleanupHistoryEvents: (() => void) | undefined;
 
     async function bindTaskEvents() {
-      cleanup = await listen<DownloadTask>("download-task-updated", (event) => {
+      cleanupTaskEvents = await listen<DownloadTask>("download-task-updated", (event) => {
         if (cancelled) {
           return;
         }
 
         setTasks((current) => upsertTask(current, event.payload));
+      });
+
+      cleanupHistoryEvents = await listen<HistoryItem>("history-item-added", (event) => {
+        if (cancelled) {
+          return;
+        }
+
+        setHistory((current) => {
+          const next = current.filter(
+            (item) =>
+              !(
+                item.title === event.payload.title &&
+                item.finishedAt === event.payload.finishedAt &&
+                item.output === event.payload.output
+              ),
+          );
+          return [event.payload, ...next];
+        });
       });
     }
 
@@ -124,7 +161,8 @@ function App() {
 
     return () => {
       cancelled = true;
-      cleanup?.();
+      cleanupTaskEvents?.();
+      cleanupHistoryEvents?.();
     };
   }, []);
 
@@ -134,15 +172,23 @@ function App() {
     .filter(Boolean);
 
   const firstUrl = normalizedUrls[0] ?? "";
-  const playlistMode = detectPlaylistMode(firstUrl);
+  const playlistMode = detectPlaylistMode(firstUrl, settings.defaultPlaylistScope);
   const selectedFormat =
     preview?.formats.find((format) => format.formatId === selectedFormatId) ?? null;
-  const setupChecks = buildSetupChecks(environment);
-  const readySetupChecks = setupChecks.filter((item) => item.status === "ready").length;
-  const missingSetupChecks = setupChecks.filter((item) => item.status !== "ready");
-  const visibleFormats = preview?.formats.slice(0, 6) ?? [];
+  const visibleFormats = filterFormatsForMode(preview?.formats ?? [], downloadMode);
   const visibleSubtitles = preview?.subtitles.slice(0, 4) ?? [];
-  const visiblePlaylistEntries = preview?.playlistEntries.slice(0, 4) ?? [];
+  const visiblePlaylistEntries = preview?.playlistEntries ?? [];
+  const selectedPlaylistEntry =
+    visiblePlaylistEntries.find((entry) => entry.index === selectedPlaylistEntryIndex) ?? null;
+  const selectedPlaylistEntryPreview =
+    (selectedPlaylistEntryIndex !== null
+      ? playlistEntryPreviews[selectedPlaylistEntryIndex]
+      : null) ?? null;
+  const visibleSelectedPlaylistEntryFormats = filterFormatsForMode(
+    selectedPlaylistEntryPreview?.formats ?? [],
+    downloadMode,
+  );
+  const settingsDirty = isSettingsDirty(settings, savedSettings);
 
   const statusCounts = tasks.reduce<Record<TaskStatus, number>>(
     (accumulator, task) => {
@@ -162,27 +208,74 @@ function App() {
     setPlaylistScope(playlistMode.defaultScope);
   }, [playlistMode.defaultScope, firstUrl]);
 
-  async function handleInstallAllMissing() {
-    setInstallError("");
-    setIsInstallingAll(true);
+  useEffect(() => {
+    setAuthModeTouched(false);
+  }, [firstUrl]);
 
-    try {
-      const snapshot = await invoke<EnvironmentSnapshot>("install_missing_dependencies");
-      setEnvironment(snapshot);
-      setSaveDirectory(snapshot.recommendedOutputDir);
-    } catch (error) {
-      setInstallError(stringifyError(error));
-    } finally {
-      setIsInstallingAll(false);
+  useEffect(() => {
+    if (authModeTouched) {
+      return;
     }
-  }
+
+    setAuthMode(preferredAuthModeForUrl(firstUrl, settings.defaultAuthMode));
+  }, [authModeTouched, firstUrl, settings.defaultAuthMode]);
+
+  useEffect(() => {
+    if (!preview) {
+      return;
+    }
+
+    const hasSelectedVisibleFormat = visibleFormats.some(
+      (format) => format.formatId === selectedFormatId,
+    );
+
+    if (!hasSelectedVisibleFormat) {
+      setSelectedFormatId(visibleFormats[0]?.formatId ?? null);
+    }
+  }, [preview, selectedFormatId, visibleFormats]);
+
+  useEffect(() => {
+    if (!preview?.isPlaylist) {
+      setSelectedPlaylistEntryIndex(null);
+      setPlaylistEntryPreviews({});
+      setPlaylistEntrySelections({});
+      setPlaylistEntryError("");
+    }
+  }, [preview]);
+
+  useEffect(() => {
+    if (!selectedPlaylistEntry || visibleSelectedPlaylistEntryFormats.length === 0) {
+      return;
+    }
+
+    const currentSelection = playlistEntrySelections[selectedPlaylistEntry.index];
+    const hasVisibleSelection = visibleSelectedPlaylistEntryFormats.some(
+      (format) => format.downloadSelector === currentSelection,
+    );
+
+    if (!hasVisibleSelection) {
+      setPlaylistEntrySelections((current) => ({
+        ...current,
+        [selectedPlaylistEntry.index]: visibleSelectedPlaylistEntryFormats[0].downloadSelector,
+      }));
+    }
+  }, [
+    playlistEntrySelections,
+    selectedPlaylistEntry,
+    visibleSelectedPlaylistEntryFormats,
+  ]);
 
   async function handleParse() {
     setParseError("");
     setDownloadError("");
+    setPlaylistEntryError("");
 
     if (!firstUrl) {
-      setParseError("请先输入一个可解析的链接。");
+      setParseError(
+        language === "en-US"
+          ? "Enter a valid link before parsing."
+          : "请先输入一个可解析的链接。",
+      );
       return;
     }
 
@@ -196,53 +289,151 @@ function App() {
           authMode,
           browser,
           cookieFile,
+          language,
         } satisfies ParseUrlPayload,
       });
 
       setPreview(nextPreview);
-      setSelectedFormatId(defaultFormatId(nextPreview));
+      setSelectedFormatId(defaultFormatId(nextPreview, downloadMode));
+      setSelectedPlaylistEntryIndex(null);
+      setPlaylistEntryPreviews({});
+      setPlaylistEntrySelections({});
     } catch (error) {
       setPreview(null);
       setSelectedFormatId(null);
+      setSelectedPlaylistEntryIndex(null);
+      setPlaylistEntryPreviews({});
+      setPlaylistEntrySelections({});
       setParseError(stringifyError(error));
     } finally {
       setIsParsing(false);
     }
   }
 
+  async function handleSelectPlaylistEntry(entry: PlaylistEntry) {
+    setSelectedPlaylistEntryIndex(entry.index);
+    setPlaylistEntryError("");
+
+    if (playlistEntryPreviews[entry.index] || !entry.sourceUrl) {
+      return;
+    }
+
+    setIsLoadingPlaylistEntry(true);
+
+    try {
+      const nextPreview = await invoke<MediaPreview>("parse_url", {
+        payload: {
+          url: entry.sourceUrl,
+          playlistScope: "video",
+          authMode,
+          browser,
+          cookieFile,
+          language,
+        } satisfies ParseUrlPayload,
+      });
+
+      setPlaylistEntryPreviews((current) => ({
+        ...current,
+        [entry.index]: nextPreview,
+      }));
+      setPlaylistEntrySelections((current) => ({
+        ...current,
+        [entry.index]:
+          current[entry.index] ??
+          defaultDownloadSelector(nextPreview, downloadMode) ??
+          "",
+      }));
+    } catch (error) {
+      setPlaylistEntryError(stringifyError(error));
+    } finally {
+      setIsLoadingPlaylistEntry(false);
+    }
+  }
+
   async function handleStartDownload() {
     setDownloadError("");
+    const defaultSelector =
+      downloadMode === "subtitles"
+        ? null
+        : selectedFormat?.downloadSelector ?? selectedFormatId;
 
-    const targetUrl = preview?.sourceUrl ?? firstUrl;
+    const batchTargets = buildBatchTargets({
+      normalizedUrls,
+      preview,
+      defaultSelector,
+      playlistEntrySelections,
+      downloadMode,
+      playlistScope,
+    });
+    const firstTargetUrl = batchTargets[0]?.url ?? "";
 
-    if (!targetUrl) {
-      setDownloadError("请先输入链接并完成解析。");
+    if (!firstTargetUrl) {
+      setDownloadError(
+        language === "en-US"
+          ? "Enter a link and parse it before downloading."
+          : "请先输入链接并完成解析。",
+      );
       return;
     }
 
     if (downloadMode !== "subtitles" && !selectedFormatId) {
-      setDownloadError("请先从解析结果中选择一个可下载格式。");
+      setDownloadError(
+        language === "en-US"
+          ? "Choose an available format from the preview first."
+          : "请先从解析结果中选择一个可下载格式。",
+      );
       return;
     }
 
     setIsStartingDownload(true);
 
     try {
-      const task = await invoke<DownloadTask>("start_download", {
-        payload: {
-          url: targetUrl,
-          mode: downloadMode,
-          formatId: downloadMode === "subtitles" ? null : selectedFormatId,
-          outputDir: saveDirectory,
-          playlistScope,
-          authMode,
-          browser,
-          cookieFile,
-        } satisfies StartDownloadPayload,
-      });
+      const results = await Promise.allSettled(
+        batchTargets.map((target) =>
+          invoke<DownloadTask>("start_download", {
+            payload: {
+              url: target.url,
+              title: target.title,
+              mode: downloadMode,
+              formatId: target.formatId,
+              outputDir: saveDirectory,
+              playlistScope: target.playlistScope,
+              authMode,
+              browser,
+              cookieFile,
+              language,
+            } satisfies StartDownloadPayload,
+          }),
+        ),
+      );
 
-      setTasks((current) => upsertTask(current, task));
-      startTransition(() => setActiveView("tasks"));
+      const succeeded = results
+        .filter((result): result is PromiseFulfilledResult<DownloadTask> => result.status === "fulfilled")
+        .map((result) => result.value);
+      const failed = results
+        .map((result, index) => ({ result, url: batchTargets[index]?.url ?? "" }))
+        .filter(
+          (item): item is {
+            result: PromiseRejectedResult;
+            url: string;
+          } => item.result.status === "rejected",
+        );
+
+      if (succeeded.length > 0) {
+        setTasks((current) =>
+          succeeded.reduce((next, task) => upsertTask(next, task), current),
+        );
+        startTransition(() => setActiveView("tasks"));
+      }
+
+      if (failed.length > 0) {
+        const previewUrls = failed
+          .slice(0, 2)
+          .map((item) => item.url)
+          .join(language === "en-US" ? "; " : "；");
+        const firstError = stringifyError(failed[0].result.reason);
+        setDownloadError(copy.downloadSummary(batchTargets.length, succeeded.length, failed.length, previewUrls, firstError));
+      }
     } catch (error) {
       setDownloadError(stringifyError(error));
     } finally {
@@ -250,77 +441,95 @@ function App() {
     }
   }
 
+  async function handleCancelTask(taskId: string) {
+    try {
+      const nextTask = await invoke<DownloadTask>("cancel_download", { taskId });
+      setTasks((current) => upsertTask(current, nextTask));
+    } catch (error) {
+      setDownloadError(stringifyError(error));
+    }
+  }
+
+  async function handleRetryTask(taskId: string) {
+    try {
+      const nextTask = await invoke<DownloadTask>("retry_download", { taskId });
+      setTasks((current) => upsertTask(current, nextTask));
+    } catch (error) {
+      setDownloadError(stringifyError(error));
+    }
+  }
+
+  async function handleClearTasks(scope: "completed" | "failed" | "all") {
+    try {
+      const nextTasks = await invoke<DownloadTask[]>("clear_tasks", { scope });
+      setTasks(nextTasks);
+    } catch (error) {
+      setDownloadError(stringifyError(error));
+    }
+  }
+
+  async function handleSaveSettings() {
+    setSettingsError("");
+    setSettingsMessage("");
+    setIsSavingSettings(true);
+
+    try {
+      const persisted = await invoke<AppSettings>("save_settings", { payload: settings });
+      setSettings(persisted);
+      setSavedSettings(persisted);
+      setDownloadMode(persisted.defaultDownloadMode);
+      setPlaylistScope(detectPlaylistMode(firstUrl, persisted.defaultPlaylistScope).defaultScope);
+      setAuthMode(preferredAuthModeForUrl(firstUrl, persisted.defaultAuthMode));
+      setAuthModeTouched(false);
+      setBrowser(persisted.defaultBrowser);
+      setCookieFile(persisted.defaultCookieFile);
+      setSaveDirectory(persisted.outputDir);
+      setSettingsMessage(copy.saveSuccess);
+    } catch (error) {
+      setSettingsError(stringifyError(error));
+    } finally {
+      setIsSavingSettings(false);
+    }
+  }
+
+  function handleResetSettings() {
+    setSettings(savedSettings);
+    setSettingsError("");
+    setSettingsMessage("");
+  }
+
+  async function handlePickOutputDirectory() {
+    setSettingsError("");
+    setSettingsMessage("");
+
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: settings.outputDir || saveDirectory,
+      });
+
+      if (typeof selected !== "string" || !selected.trim()) {
+        return;
+      }
+
+      setSettings((current) => ({
+        ...current,
+        outputDir: selected,
+      }));
+    } catch (error) {
+      setSettingsError(stringifyError(error));
+    }
+  }
+
   return (
     <main className="app-shell">
-      <section className="hero-card">
-        <div className="hero-topbar">
-          <div className="hero-heading">
-            <p className="eyebrow">首次安装</p>
-            <h2>当前依赖信息</h2>
-          </div>
-
-          <div className="hero-summary">
-            <div className="metric-chip">
-              <span>安装器</span>
-              <strong>{environment.installerAvailable ? "Homebrew" : "手动安装"}</strong>
-            </div>
-            <div className="metric-chip">
-              <span>依赖就绪</span>
-              <strong>
-                {readySetupChecks}/{setupChecks.length}
-              </strong>
-            </div>
-            <div className="metric-chip">
-              <span>任务数</span>
-              <strong>{tasks.length}</strong>
-            </div>
-          </div>
-
-          {missingSetupChecks.length > 0 ? (
-            <div className="setup-list compact hero-setup-list">
-              {missingSetupChecks.map((check) => (
-                <div key={check.id} className="setup-row compact">
-                  <div className="setup-title-row">
-                    <strong>{check.label}</strong>
-                    <small>{check.version ?? "未检测到"}</small>
-                  </div>
-                  <span className={`status-badge ${check.status}`}>
-                    {check.status === "missing" ? "缺失" : "提示"}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="setup-ready-note">当前依赖已全部就绪，无需额外安装。</div>
-          )}
-
-          <div className="setup-action-row compact">
-            <button
-              type="button"
-              className="secondary-action"
-              onClick={() => void handleInstallAllMissing()}
-              disabled={
-                isInstallingAll ||
-                !environment.installerAvailable ||
-                missingSetupChecks.length === 0
-              }
-            >
-              {isInstallingAll ? "安装中..." : "一键安装全部缺失依赖"}
-            </button>
-            {installError ? <p className="error-banner compact inline">{installError}</p> : null}
-            {!environment.installerAvailable ? (
-              <small className="supporting-copy">未检测到 Homebrew，当前只能手动安装。</small>
-            ) : null}
-          </div>
-        </div>
-      </section>
-
       <nav className="top-nav" aria-label="Primary">
         {[
-          { id: "download", label: "下载" },
-          { id: "tasks", label: "任务" },
-          { id: "history", label: "历史" },
-          { id: "settings", label: "设置" },
+          { id: "download", label: copy.tabs.download },
+          { id: "tasks", label: copy.tabs.tasks },
+          { id: "history", label: copy.tabs.history },
+          { id: "settings", label: copy.tabs.settings },
         ].map((tab) => (
           <button
             key={tab.id}
@@ -340,78 +549,57 @@ function App() {
           <article className="panel composer-panel">
             <div className="panel-header">
               <div>
-                <p className="eyebrow">链接输入</p>
-                <h2>先解析，再选格式下载</h2>
+                <p className="eyebrow">{copy.input.eyebrow}</p>
+                <h2>{copy.input.title}</h2>
               </div>
-              <span className="panel-tag">当前解析第一条链接</span>
+              <span className="panel-tag">{copy.input.currentParse}</span>
             </div>
+            <div className="panel-scroll-body">
+              <label className="field-label" htmlFor="urls">
+                {copy.input.urlLabel}
+              </label>
+              <textarea
+                id="urls"
+                className="url-input"
+                value={urlInput}
+                onChange={(event) => setUrlInput(event.currentTarget.value)}
+                placeholder={copy.input.urlPlaceholder}
+              />
 
-            <label className="field-label" htmlFor="urls">
-              视频或播放列表 URL
-            </label>
-            <textarea
-              id="urls"
-              className="url-input"
-              value={urlInput}
-              onChange={(event) => setUrlInput(event.currentTarget.value)}
-              placeholder="粘贴一个或多个链接。当前会先解析第一条。"
-            />
+              <p className="helper-copy compact">{copy.parseBatchSummary(normalizedUrls.length)}</p>
 
-            <p className="helper-copy compact">
-              已识别 {normalizedUrls.length} 条链接，当前解析目标：
-              <strong>{firstUrl || " 未输入"}</strong>
-            </p>
-
-            {playlistMode.showScopeSelector ? (
-              <div className="inline-card scope-card">
-                <span className="field-label">解析范围</span>
-                <div className="scope-grid">
-                  {playlistScopeOptions.map((option) => (
-                    <button
-                      key={option.value}
-                      type="button"
-                      className={
-                        option.value === playlistScope
-                          ? "select-chip active"
-                          : "select-chip"
-                      }
-                      onClick={() => setPlaylistScope(option.value)}
-                    >
-                      <strong>{option.label}</strong>
-                      <span>{option.hint}</span>
-                    </button>
-                  ))}
+              {playlistMode.showScopeSelector ? (
+                <div className="inline-card scope-card">
+                  <span className="field-label">{copy.input.parseScope}</span>
+                  <div className="scope-grid">
+                    {playlistScopeOptions.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        className={
+                          option.value === playlistScope
+                            ? "select-chip active"
+                            : "select-chip"
+                        }
+                        onClick={() => setPlaylistScope(option.value)}
+                      >
+                        <strong>{option.label}</strong>
+                        <span>{option.hint}</span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ) : null}
+              ) : null}
 
-            <div className="chip-grid">
-              {modeOptions.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  className={
-                    option.value === downloadMode ? "select-chip active" : "select-chip"
-                  }
-                  onClick={() => setDownloadMode(option.value)}
-                >
-                  <strong>{option.label}</strong>
-                  <span>{option.hint}</span>
-                </button>
-              ))}
-            </div>
-
-            <div className="inline-card auth-card">
-              <span className="field-label">认证方式</span>
-              <div className="auth-grid">
-                {authOptions.map((option) => (
+              <div className="chip-grid">
+                {modeOptions.map((option) => (
                   <button
                     key={option.value}
                     type="button"
                     className={
-                      option.value === authMode ? "select-chip active" : "select-chip"
+                      option.value === downloadMode ? "select-chip active" : "select-chip"
                     }
-                    onClick={() => setAuthMode(option.value)}
+                    onClick={() => setDownloadMode(option.value)}
                   >
                     <strong>{option.label}</strong>
                     <span>{option.hint}</span>
@@ -419,209 +607,296 @@ function App() {
                 ))}
               </div>
 
-              {authMode === "browser" ? (
-                <div className="auth-detail-row">
-                  <label className="field-label" htmlFor="cookie-browser">
-                    浏览器
-                  </label>
-                  <select
-                    id="cookie-browser"
-                    value={browser}
-                    onChange={(event) => setBrowser(event.currentTarget.value as CookieBrowser)}
-                  >
-                    {browserOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+              <div className="inline-card auth-card">
+                <span className="field-label">{copy.input.authMethod}</span>
+                <div className="auth-grid">
+                  {authOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={
+                        option.value === authMode ? "select-chip active" : "select-chip"
+                      }
+                      onClick={() => {
+                        setAuthModeTouched(true);
+                        setAuthMode(option.value);
+                      }}
+                    >
+                      <strong>{option.label}</strong>
+                      <span>{option.hint}</span>
+                    </button>
+                  ))}
                 </div>
-              ) : null}
 
-              {authMode === "file" ? (
-                <div className="auth-detail-row">
-                  <label className="field-label" htmlFor="cookie-file">
-                    Cookie 文件路径
-                  </label>
-                  <input
-                    id="cookie-file"
-                    value={cookieFile}
-                    onChange={(event) => setCookieFile(event.currentTarget.value)}
-                    placeholder="例如 ~/Downloads/youtube-cookies.txt"
-                  />
-                </div>
-              ) : null}
-            </div>
+                {isBilibiliUrl(firstUrl) ? (
+                  <p className="helper-copy compact">{copy.input.bilibiliHint}</p>
+                ) : null}
 
-            {parseError ? <p className="error-banner">{parseError}</p> : null}
-            {downloadError ? <p className="error-banner">{downloadError}</p> : null}
+                {authMode === "browser" ? (
+                  <div className="auth-detail-row">
+                    <label className="field-label" htmlFor="cookie-browser">
+                      {copy.input.browser}
+                    </label>
+                    <select
+                      id="cookie-browser"
+                      value={browser}
+                      onChange={(event) => setBrowser(event.currentTarget.value as CookieBrowser)}
+                    >
+                      {browserOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
 
-            <div className="selection-summary">
-              <span>当前选择</span>
-              <strong>
-                {selectedFormat
-                  ? `${selectedFormat.label} / ${selectedFormat.detail}`
-                  : "等待解析后选择格式"}
-              </strong>
-            </div>
+                {authMode === "file" ? (
+                  <div className="auth-detail-row">
+                    <label className="field-label" htmlFor="cookie-file">
+                      {copy.input.cookieFile}
+                    </label>
+                    <input
+                      id="cookie-file"
+                      value={cookieFile}
+                      onChange={(event) => setCookieFile(event.currentTarget.value)}
+                      placeholder={copy.input.cookiePlaceholder}
+                    />
+                  </div>
+                ) : null}
+              </div>
 
-            <div className="action-row">
-              <button
-                type="button"
-                className="primary-action"
-                onClick={() => void handleParse()}
-                disabled={isParsing}
-              >
-                {isParsing ? "解析中..." : "解析链接"}
-              </button>
-              <button
-                type="button"
-                className="secondary-action"
-                onClick={() => void handleStartDownload()}
-                disabled={isStartingDownload}
-              >
-                {isStartingDownload ? "启动中..." : "下载所选格式"}
-              </button>
+              {parseError ? <p className="error-banner">{parseError}</p> : null}
+              {downloadError ? <p className="error-banner">{downloadError}</p> : null}
+
+              <div className="selection-summary">
+                <span>{copy.input.currentSelection}</span>
+                <strong>
+                  {selectedFormat
+                    ? `${selectedFormat.label} / ${selectedFormat.detail}`
+                    : copy.input.waitingFormat}
+                </strong>
+              </div>
+
+              <div className="action-row">
+                <button
+                  type="button"
+                  className="primary-action"
+                  onClick={() => void handleParse()}
+                  disabled={isParsing}
+                >
+                  {isParsing ? copy.input.parsingButton : copy.input.parseButton}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => void handleStartDownload()}
+                  disabled={isStartingDownload}
+                >
+                  {isStartingDownload
+                    ? copy.startingLabel(normalizedUrls.length)
+                    : copy.startDownloadLabel(normalizedUrls.length)}
+                </button>
+              </div>
             </div>
           </article>
 
           <article className="panel preview-panel preview-panel-wide">
             <div className="panel-header">
               <div>
-                <p className="eyebrow">解析结果</p>
-                <h2>{preview?.title ?? "等待解析"}</h2>
+                <p className="eyebrow">{copy.preview.eyebrow}</p>
+                <h2>{preview?.title ?? copy.preview.waiting}</h2>
               </div>
-              <span className="panel-tag">{preview?.platform ?? "yt-dlp"}</span>
+              <span className="panel-tag">{preview?.platform ?? copy.appName}</span>
             </div>
+            <div className="panel-scroll-body">
+              {preview ? (
+                <>
+                  <div
+                    className="preview-cover"
+                    style={{ backgroundImage: `url(${preview.thumbnail})` }}
+                  />
 
-            {preview ? (
-              <>
-                <div
-                  className="preview-cover"
-                  style={{ backgroundImage: `url(${preview.thumbnail})` }}
-                />
-
-                <div className="meta-grid">
-                  <div>
-                    <span>作者</span>
-                    <strong>{preview.creator}</strong>
-                  </div>
-                  <div>
-                    <span>时长</span>
-                    <strong>{preview.duration}</strong>
-                  </div>
-                  <div>
-                    <span>发布日期</span>
-                    <strong>{preview.publishedAt}</strong>
-                  </div>
-                  <div>
-                    <span>内容类型</span>
-                    <strong>
-                      {playlistScope === "video"
-                        ? "当前视频"
-                        : preview.isPlaylist
-                        ? `播放列表 (${preview.totalEntries} 项)`
-                        : "单个媒体"}
-                    </strong>
-                  </div>
-                </div>
-
-                <div className="stack-section">
-                  <div className="section-title-row">
-                    <h3>可下载格式</h3>
-                    <span className="text-meta">{preview.formats.length} 项</span>
-                  </div>
-                  <div className="list-stack format-grid">
-                    {visibleFormats.length > 0 ? (
-                      visibleFormats.map((format) => (
-                        <button
-                          key={format.formatId}
-                          type="button"
-                          className={
-                            format.formatId === selectedFormatId
-                              ? "list-card format-card active"
-                              : "list-card format-card"
-                          }
-                          onClick={() => setSelectedFormatId(format.formatId)}
-                        >
-                          <div>
-                            <strong>{format.label}</strong>
-                            <p>{format.detail}</p>
-                          </div>
-                          <div className="format-side">
-                            <span>{format.size}</span>
-                            <small>{format.kind}</small>
-                          </div>
-                        </button>
-                      ))
-                    ) : (
-                      <div className="empty-state">
-                        当前结果没有可直接下载的媒体格式，常见于播放列表预览或站点限制。
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="stack-section stack-two-column">
-                  <section>
-                    <div className="section-title-row">
-                      <h3>字幕</h3>
-                      <span className="text-meta">{preview.subtitles.length} 项</span>
+                  <div className="meta-grid">
+                    <div>
+                      <span>{copy.preview.author}</span>
+                      <strong>{preview.creator}</strong>
                     </div>
-                    <div className="list-stack compact">
-                      {visibleSubtitles.length > 0 ? (
-                        visibleSubtitles.map((subtitle) => (
-                          <div
-                            key={`${subtitle.language}-${subtitle.type}-${subtitle.format}`}
-                            className="list-card"
+                    <div>
+                      <span>{copy.preview.duration}</span>
+                      <strong>{preview.duration}</strong>
+                    </div>
+                    <div>
+                      <span>{copy.preview.publishedAt}</span>
+                      <strong>{preview.publishedAt}</strong>
+                    </div>
+                    <div>
+                      <span>{copy.preview.contentType}</span>
+                      <strong>
+                        {playlistScope === "video"
+                          ? copy.preview.currentVideo
+                          : preview.isPlaylist
+                          ? copy.preview.playlistLabel(preview.totalEntries)
+                          : copy.preview.singleMedia}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div className="stack-section">
+                    <div className="section-title-row">
+                      <h3>{copy.preview.downloadableFormats}</h3>
+                      <span className="text-meta">{copy.preview.itemCount(preview.formats.length)}</span>
+                    </div>
+                    <div className="list-stack format-grid">
+                      {visibleFormats.length > 0 ? (
+                        visibleFormats.map((format) => (
+                          <button
+                            key={format.formatId}
+                            type="button"
+                            className={
+                              format.formatId === selectedFormatId
+                                ? "list-card format-card active"
+                                : "list-card format-card"
+                            }
+                            onClick={() => setSelectedFormatId(format.formatId)}
                           >
                             <div>
-                              <strong>{subtitle.language}</strong>
-                              <p>{subtitle.type}</p>
+                              <strong>{format.label}</strong>
+                              <p>{format.detail}</p>
                             </div>
-                            <span>{subtitle.format}</span>
-                          </div>
+                            <div className="format-side">
+                              <span>{format.size}</span>
+                              <small>{format.kind}</small>
+                            </div>
+                          </button>
                         ))
                       ) : (
-                        <div className="empty-state">当前内容没有可用字幕信息。</div>
+                        <div className="empty-state">{copy.preview.noFormats}</div>
                       )}
                     </div>
-                  </section>
+                  </div>
 
-                  <section>
-                    <div className="section-title-row">
-                      <h3>播放列表预览</h3>
+                  <div className="stack-section stack-two-column">
+                    <section>
+                      <div className="section-title-row">
+                        <h3>{copy.preview.subtitles}</h3>
+                        <span className="text-meta">{copy.preview.itemCount(preview.subtitles.length)}</span>
+                      </div>
+                      <div className="list-stack compact">
+                        {visibleSubtitles.length > 0 ? (
+                          visibleSubtitles.map((subtitle) => (
+                            <div
+                              key={`${subtitle.language}-${subtitle.type}-${subtitle.format}`}
+                              className="list-card"
+                            >
+                              <div>
+                                <strong>{subtitle.language}</strong>
+                                <p>{subtitle.type}</p>
+                              </div>
+                              <span>{subtitle.format}</span>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="empty-state">{copy.preview.noSubtitles}</div>
+                        )}
+                      </div>
+                    </section>
+
+                    <section>
+                      <div className="section-title-row">
+                        <h3>{copy.preview.playlistPreview}</h3>
                       <span className="text-meta">
-                        {preview.isPlaylist ? `${preview.totalEntries} 项` : "非播放列表"}
+                        {preview.isPlaylist
+                          ? copy.preview.itemCount(preview.totalEntries)
+                          : copy.preview.notPlaylist}
                       </span>
                     </div>
                     <div className="list-stack compact">
                       {visiblePlaylistEntries.length > 0 ? (
                         visiblePlaylistEntries.map((entry) => (
-                          <div key={entry.index} className="list-card">
+                          <button
+                            key={entry.index}
+                            type="button"
+                            className={
+                              entry.index === selectedPlaylistEntryIndex
+                                ? "list-card playlist-entry-button active"
+                                : "list-card playlist-entry-button"
+                            }
+                            onClick={() => void handleSelectPlaylistEntry(entry)}
+                          >
                             <div>
                               <strong>
                                 #{entry.index} {entry.title}
                               </strong>
                             </div>
                             <span>{entry.duration}</span>
-                          </div>
+                          </button>
                         ))
                       ) : (
-                        <div className="empty-state">
-                          当前解析结果不是播放列表，或站点没有返回条目预览。
-                        </div>
+                        <div className="empty-state">{copy.preview.noPlaylistEntries}</div>
                       )}
                     </div>
+
+                    {preview.isPlaylist ? (
+                      <div className="stack-section">
+                        <div className="section-title-row">
+                          <h3>{copy.preview.entryFormats}</h3>
+                          <span className="text-meta">
+                            {selectedPlaylistEntry
+                              ? `#${selectedPlaylistEntry.index}`
+                              : copy.preview.clickEntry}
+                          </span>
+                        </div>
+                        {playlistEntryError ? (
+                          <div className="error-banner">{playlistEntryError}</div>
+                        ) : null}
+                        {isLoadingPlaylistEntry ? (
+                          <div className="empty-state">{copy.preview.loadingEntryFormats}</div>
+                        ) : selectedPlaylistEntry && visibleSelectedPlaylistEntryFormats.length > 0 ? (
+                          <div className="list-stack format-grid">
+                            {visibleSelectedPlaylistEntryFormats.map((format) => (
+                              <button
+                                key={`${selectedPlaylistEntry.index}-${format.formatId}`}
+                                type="button"
+                                className={
+                                  playlistEntrySelections[selectedPlaylistEntry.index] ===
+                                  format.downloadSelector
+                                    ? "list-card format-card active"
+                                    : "list-card format-card"
+                                }
+                                onClick={() =>
+                                  setPlaylistEntrySelections((current) => ({
+                                    ...current,
+                                    [selectedPlaylistEntry.index]: format.downloadSelector,
+                                  }))
+                                }
+                              >
+                                <div>
+                                  <strong>{format.label}</strong>
+                                  <p>{format.detail}</p>
+                                </div>
+                                <div className="format-side">
+                                  <span>{format.size}</span>
+                                  <small>{format.kind}</small>
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="empty-state">{copy.preview.entryFormatsHint}</div>
+                        )}
+                      </div>
+                    ) : null}
                   </section>
                 </div>
-              </>
-            ) : (
-              <div className="empty-preview">
-                <p>还没有解析结果。</p>
-                <span>先解析链接，右侧会撑满展示所有可下载格式，再从中选择下载。</span>
+                </>
+              ) : (
+                <div className="empty-preview">
+                  <p>{copy.preview.emptyTitle}</p>
+                  <span>{copy.preview.emptyHint}</span>
+                </div>
+              )}
               </div>
-            )}
           </article>
         </section>
       ) : null}
@@ -631,61 +906,105 @@ function App() {
           <article className="panel wide-panel">
             <div className="panel-header">
               <div>
-                <p className="eyebrow">任务中心</p>
-                <h2>下载队列总览</h2>
+                <p className="eyebrow">{copy.tasks.eyebrow}</p>
+                <h2>{copy.tasks.title}</h2>
               </div>
-              <span className="panel-tag">
-                运行中 {statusCounts.running} / 失败 {statusCounts.failed}
-              </span>
+              <div className="task-toolbar">
+                <span className="panel-tag">
+                  {copy.tasks.runningFailed(statusCounts.running, statusCounts.failed)}
+                </span>
+                <button
+                  type="button"
+                  className="ghost-action"
+                  onClick={() => void handleClearTasks("completed")}
+                >
+                  {copy.tasks.clearCompleted}
+                </button>
+                <button
+                  type="button"
+                  className="ghost-action"
+                  onClick={() => void handleClearTasks("failed")}
+                >
+                  {copy.tasks.clearFailed}
+                </button>
+                <button
+                  type="button"
+                  className="ghost-action"
+                  onClick={() => void handleClearTasks("all")}
+                >
+                  {copy.tasks.clearAll}
+                </button>
+              </div>
             </div>
+            <div className="panel-scroll-body">
+              <div className="task-stats">
+                <div className="metric-card small">
+                  <span>{copy.tasks.queued}</span>
+                  <strong>{statusCounts.queued}</strong>
+                </div>
+                <div className="metric-card small">
+                  <span>{copy.tasks.running}</span>
+                  <strong>{statusCounts.running}</strong>
+                </div>
+                <div className="metric-card small">
+                  <span>{copy.tasks.done}</span>
+                  <strong>{statusCounts.done}</strong>
+                </div>
+                <div className="metric-card small">
+                  <span>{copy.tasks.failed}</span>
+                  <strong>{statusCounts.failed + statusCounts.cancelled}</strong>
+                </div>
+              </div>
 
-            <div className="task-stats">
-              <div className="metric-card small">
-                <span>等待中</span>
-                <strong>{statusCounts.queued}</strong>
-              </div>
-              <div className="metric-card small">
-                <span>下载中</span>
-                <strong>{statusCounts.running}</strong>
-              </div>
-              <div className="metric-card small">
-                <span>已完成</span>
-                <strong>{statusCounts.done}</strong>
-              </div>
-              <div className="metric-card small">
-                <span>失败</span>
-                <strong>{statusCounts.failed}</strong>
-              </div>
-            </div>
-
-            <div className="list-stack">
-              {tasks.length > 0 ? (
-                tasks.map((task) => (
-                  <div key={task.id} className="task-row">
-                    <div className="task-main">
-                      <div className="task-title-row">
-                        <strong>{task.title}</strong>
-                        <span className={`status-badge ${task.status}`}>
-                          {task.status}
-                        </span>
+              <div className="list-stack">
+                {tasks.length > 0 ? (
+                  tasks.map((task) => (
+                    <div key={task.id} className="task-row">
+                      <div className="task-main">
+                        <div className="task-title-row">
+                          <strong>{task.title}</strong>
+                          <span className={`status-badge ${task.status}`}>
+                            {statusLabelFor(language, task.status)}
+                          </span>
+                        </div>
+                        <div className="progress-track">
+                          <span style={{ width: `${task.progress}%` }} />
+                        </div>
+                        <p>{task.output}</p>
+                        <small className="task-profile">{task.profile}</small>
+                        {task.error ? <small className="task-error">{task.error}</small> : null}
                       </div>
-                      <div className="progress-track">
-                        <span style={{ width: `${task.progress}%` }} />
+                      <div className="task-side">
+                        <strong>{Math.round(task.progress)}%</strong>
+                        <small>{task.speed}</small>
+                        <small>{task.eta}</small>
+                        <div className="task-actions">
+                          {(task.status === "queued" || task.status === "running") ? (
+                            <button
+                              type="button"
+                              className="ghost-action"
+                              onClick={() => void handleCancelTask(task.id)}
+                            >
+                              {copy.tasks.cancel}
+                            </button>
+                          ) : null}
+                          {(task.status === "failed" || task.status === "cancelled") ? (
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              onClick={() => void handleRetryTask(task.id)}
+                            >
+                              {copy.tasks.retry}
+                            </button>
+                          ) : null}
+                        </div>
                       </div>
-                      <p>{task.output}</p>
-                      <small className="task-profile">{task.profile}</small>
-                      {task.error ? <small className="task-error">{task.error}</small> : null}
                     </div>
-                    <div className="task-side">
-                      <strong>{Math.round(task.progress)}%</strong>
-                      <small>{task.speed}</small>
-                      <small>{task.eta}</small>
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <div className="empty-state">还没有任务。先在下载页解析格式并发起下载。</div>
-              )}
+                  ))
+                ) : (
+                  <div className="empty-state">{copy.tasks.empty}</div>
+                )}
+              </div>
             </div>
           </article>
         </section>
@@ -696,25 +1015,31 @@ function App() {
           <article className="panel wide-panel">
             <div className="panel-header">
               <div>
-                <p className="eyebrow">历史记录</p>
-                <h2>最近完成的任务</h2>
+                <p className="eyebrow">{copy.history.eyebrow}</p>
+                <h2>{copy.history.title}</h2>
               </div>
-              <span className="panel-tag">{historyData.length} 条示例记录</span>
+              <span className="panel-tag">{copy.history.count(history.length)}</span>
             </div>
 
-            <div className="list-stack">
-              {historyData.map((item) => (
-                <div key={`${item.title}-${item.finishedAt}`} className="history-row">
-                  <div>
-                    <strong>{item.title}</strong>
-                    <p>{item.profile}</p>
-                  </div>
-                  <div className="history-meta">
-                    <span>{item.finishedAt}</span>
-                    <small>{item.output}</small>
-                  </div>
-                </div>
-              ))}
+            <div className="panel-scroll-body">
+              <div className="list-stack">
+                {history.length > 0 ? (
+                  history.map((item) => (
+                    <div key={`${item.title}-${item.finishedAt}`} className="history-row">
+                      <div>
+                        <strong>{item.title}</strong>
+                        <p>{item.profile}</p>
+                      </div>
+                      <div className="history-meta">
+                        <span>{item.finishedAt}</span>
+                        <small>{item.output}</small>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="empty-state">{copy.history.empty}</div>
+                )}
+              </div>
             </div>
           </article>
         </section>
@@ -722,62 +1047,341 @@ function App() {
 
       {activeView === "settings" ? (
         <section className="content-grid settings-grid">
-          {settingsGroups.map((group) => (
-            <article key={group.title} className="panel">
-              <div className="panel-header">
-                <div>
-                  <p className="eyebrow">设置</p>
-                  <h2>{group.title}</h2>
+          <article className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">{copy.settings.eyebrow}</p>
+                <h2>{copy.settings.defaultsTitle}</h2>
+              </div>
+              <span className="panel-tag">{copy.settings.startupTag}</span>
+            </div>
+
+            <div className="panel-scroll-body settings-form">
+              <div className="settings-field">
+                <span className="field-label">{copy.settings.languageLabel}</span>
+                <div className="settings-browser-grid">
+                  {(["zh-CN", "en-US"] as AppLanguage[]).map((value) => (
+                    <button
+                      key={`settings-language-${value}`}
+                      type="button"
+                      className={settings.language === value ? "select-chip active" : "select-chip"}
+                      onClick={() =>
+                        setSettings((current) => ({
+                          ...current,
+                          language: value,
+                        }))
+                      }
+                    >
+                      <strong>{copy.languages[value]}</strong>
+                    </button>
+                  ))}
                 </div>
               </div>
 
-              <p className="supporting-copy">{group.description}</p>
-
-              <div className="list-stack compact">
-                {group.items.map((item) => (
-                  <div key={item.label} className="setting-row">
-                    <span>{item.label}</span>
-                    <strong>{item.value}</strong>
-                  </div>
-                ))}
+              <div className="settings-field">
+                <label className="field-label" htmlFor="settings-output-dir">
+                  {copy.settings.outputDir}
+                </label>
+                <div className="path-picker-row">
+                  <input
+                    id="settings-output-dir"
+                    value={settings.outputDir}
+                    readOnly
+                    placeholder={copy.settings.outputPlaceholder}
+                  />
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    onClick={() => void handlePickOutputDirectory()}
+                  >
+                    {copy.settings.pickDirectory}
+                  </button>
+                </div>
+                <p className="helper-copy compact">
+                  {copy.settings.outputHint}
+                </p>
               </div>
-            </article>
-          ))}
+
+              <div className="settings-field">
+                <span className="field-label">{copy.settings.defaultMode}</span>
+                <div className="chip-grid">
+                  {modeOptions.map((option) => (
+                    <button
+                      key={`settings-mode-${option.value}`}
+                      type="button"
+                      className={
+                        settings.defaultDownloadMode === option.value
+                          ? "select-chip active"
+                          : "select-chip"
+                      }
+                      onClick={() =>
+                        setSettings((current) => ({
+                          ...current,
+                          defaultDownloadMode: option.value,
+                        }))
+                      }
+                    >
+                      <strong>{option.label}</strong>
+                      <span>{option.hint}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="settings-field">
+                <span className="field-label">{copy.settings.defaultScope}</span>
+                <div className="scope-grid">
+                  {playlistScopeOptions.map((option) => (
+                    <button
+                      key={`settings-scope-${option.value}`}
+                      type="button"
+                      className={
+                        settings.defaultPlaylistScope === option.value
+                          ? "select-chip active"
+                          : "select-chip"
+                      }
+                      onClick={() =>
+                        setSettings((current) => ({
+                          ...current,
+                          defaultPlaylistScope: option.value,
+                        }))
+                      }
+                    >
+                      <strong>{option.label}</strong>
+                      <span>{option.hint}</span>
+                    </button>
+                  ))}
+                </div>
+                <p className="helper-copy compact">
+                  {copy.settings.scopeHint}
+                </p>
+              </div>
+            </div>
+          </article>
+
+          <article className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">{copy.settings.eyebrow}</p>
+                <h2>{copy.settings.authTitle}</h2>
+              </div>
+              <span className="panel-tag">{copy.settings.authTag}</span>
+            </div>
+
+            <div className="panel-scroll-body settings-form">
+              <div className="settings-field">
+                <span className="field-label">{copy.settings.defaultAuth}</span>
+                <div className="auth-grid">
+                  {authOptions.map((option) => (
+                    <button
+                      key={`settings-auth-${option.value}`}
+                      type="button"
+                      className={
+                        settings.defaultAuthMode === option.value
+                          ? "select-chip active"
+                          : "select-chip"
+                      }
+                      onClick={() =>
+                        setSettings((current) => ({
+                          ...current,
+                          defaultAuthMode: option.value,
+                        }))
+                      }
+                    >
+                      <strong>{option.label}</strong>
+                      <span>{option.hint}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {settings.defaultAuthMode === "browser" ? (
+                <div className="settings-field">
+                  <span className="field-label">{copy.settings.defaultBrowser}</span>
+                  <div className="settings-browser-grid">
+                    {browserOptions.map((option) => (
+                      <button
+                        key={`settings-browser-${option.value}`}
+                        type="button"
+                        className={
+                          settings.defaultBrowser === option.value
+                            ? "select-chip active"
+                            : "select-chip"
+                        }
+                        onClick={() =>
+                          setSettings((current) => ({
+                            ...current,
+                            defaultBrowser: option.value,
+                          }))
+                        }
+                      >
+                        <strong>{option.label}</strong>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {settings.defaultAuthMode === "file" ? (
+                <div className="settings-field">
+                  <label className="field-label" htmlFor="settings-cookie-file">
+                    {copy.settings.defaultCookieFile}
+                  </label>
+                  <input
+                    id="settings-cookie-file"
+                    value={settings.defaultCookieFile}
+                    onChange={(event) =>
+                      setSettings((current) => ({
+                        ...current,
+                        defaultCookieFile: event.currentTarget.value,
+                      }))
+                    }
+                    placeholder={copy.settings.defaultCookiePlaceholder}
+                  />
+                </div>
+              ) : null}
+            </div>
+          </article>
+
+          <article className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">{copy.settings.eyebrow}</p>
+                <h2>{copy.settings.saveTitle}</h2>
+              </div>
+              <span className="panel-tag">
+                {settingsDirty ? copy.settings.dirtyTag : copy.settings.syncedTag}
+              </span>
+            </div>
+
+            <div className="panel-scroll-body settings-form">
+              <div className="settings-summary-card">
+                <div className="setting-row">
+                  <span>{copy.settings.currentOutput}</span>
+                  <strong>{settings.outputDir || copy.settings.notSet}</strong>
+                </div>
+                <div className="setting-row">
+                  <span>{copy.settings.summaryMode}</span>
+                  <strong>{labelForMode(settings.defaultDownloadMode, language)}</strong>
+                </div>
+                <div className="setting-row">
+                  <span>{copy.settings.summaryAuth}</span>
+                  <strong>{labelForAuthMode(settings.defaultAuthMode, language)}</strong>
+                </div>
+              </div>
+
+              {settingsError ? <p className="error-banner">{settingsError}</p> : null}
+              {settingsMessage ? <p className="success-banner">{settingsMessage}</p> : null}
+
+              <div className="action-row settings-actions">
+                <button
+                  type="button"
+                  className="primary-action"
+                  onClick={() => void handleSaveSettings()}
+                  disabled={isSavingSettings || !settingsDirty}
+                >
+                  {isSavingSettings ? copy.settings.saving : copy.settings.save}
+                </button>
+                <button
+                  type="button"
+                  className="ghost-action"
+                  onClick={handleResetSettings}
+                  disabled={isSavingSettings || !settingsDirty}
+                >
+                  {copy.settings.reset}
+                </button>
+              </div>
+
+              <p className="supporting-copy">
+                {copy.settings.saveHint}
+              </p>
+            </div>
+          </article>
         </section>
       ) : null}
     </main>
   );
 }
 
-function buildSetupChecks(environment: EnvironmentSnapshot) {
-  const ytDlp = environment.checks.find((check) => check.id === "yt-dlp");
-  const ffmpeg = environment.checks.find((check) => check.id === "ffmpeg");
-  const runtime = environment.checks.find((check) => check.id === "runtime");
+function buildDefaultSettings(): AppSettings {
+  return {
+    outputDir: fallbackEnvironment.recommendedOutputDir,
+    defaultDownloadMode: "video",
+    defaultPlaylistScope: "video",
+    defaultAuthMode: "none",
+    defaultBrowser: "chrome",
+    defaultCookieFile: "",
+    language: "zh-CN",
+  };
+}
 
-  const items: Array<EnvironmentCheck & { installTarget?: string }> = [];
+function defaultFormatId(preview: MediaPreview, mode: DownloadMode) {
+  return filterFormatsForMode(preview.formats, mode)[0]?.formatId ?? null;
+}
 
-  if (ytDlp) {
-    items.push({ ...ytDlp, installTarget: "yt-dlp" });
+function defaultDownloadSelector(preview: MediaPreview, mode: DownloadMode) {
+  return filterFormatsForMode(preview.formats, mode)[0]?.downloadSelector ?? null;
+}
+
+function filterFormatsForMode(formats: MediaPreview["formats"], mode: DownloadMode) {
+  if (mode === "audio") {
+    return formats.filter((format) => format.kind === "audio");
   }
 
-  if (ffmpeg) {
-    items.push({ ...ffmpeg, installTarget: "ffmpeg" });
-  }
+  if (mode === "video" || mode === "video+subtitles") {
+    return formats.filter((format) => {
+      if (format.kind === "audio") {
+        return false;
+      }
 
-  if (runtime) {
-    items.push({
-      ...runtime,
-      label: "JavaScript Runtime",
-      installTarget: runtime.status !== "ready" ? "node" : undefined,
+      const height = parseFormatHeight(format.label);
+      return height === null || height > 360;
     });
   }
 
-  return items;
+  return formats;
 }
 
-function defaultFormatId(preview: MediaPreview) {
-  const combined = preview.formats.find((format) => format.kind === "combined");
-  return combined?.formatId ?? preview.formats[0]?.formatId ?? null;
+function parseFormatHeight(label: string) {
+  const match = label.match(/(\d+)p/i);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function buildBatchTargets({
+  normalizedUrls,
+  preview,
+  defaultSelector,
+  playlistEntrySelections,
+  downloadMode,
+  playlistScope,
+}: {
+  normalizedUrls: string[];
+  preview: MediaPreview | null;
+  defaultSelector: string | null;
+  playlistEntrySelections: Record<number, string>;
+  downloadMode: DownloadMode;
+  playlistScope: PlaylistScope;
+}) {
+  if (preview?.isPlaylist && playlistScope === "playlist" && preview.playlistEntries.length > 0) {
+    return preview.playlistEntries
+      .filter((entry) => entry.sourceUrl)
+      .map((entry) => ({
+        url: entry.sourceUrl,
+        title: entry.title,
+        formatId:
+          downloadMode === "subtitles"
+            ? null
+            : playlistEntrySelections[entry.index] || defaultSelector,
+        playlistScope: "video" as PlaylistScope,
+      }));
+  }
+
+  return normalizedUrls.map((url, index) => ({
+    url: index === 0 ? preview?.sourceUrl ?? url : url,
+    title: index === 0 ? preview?.title ?? null : null,
+    formatId: downloadMode === "subtitles" ? null : defaultSelector,
+    playlistScope,
+  }));
 }
 
 function upsertTask(tasks: DownloadTask[], nextTask: DownloadTask) {
@@ -799,12 +1403,37 @@ function stringifyError(error: unknown) {
     return error.message;
   }
 
-  return "发生了未知错误";
+  return copyFor("zh-CN").unknownError;
 }
 
-function detectPlaylistMode(url: string) {
+function isSettingsDirty(current: AppSettings, saved: AppSettings) {
+  return JSON.stringify(current) !== JSON.stringify(saved);
+}
+
+function labelForMode(mode: DownloadMode, language: AppLanguage) {
+  return modeOptionsFor(language).find((option) => option.value === mode)?.label ?? mode;
+}
+
+function labelForAuthMode(mode: AuthMode, language: AppLanguage) {
+  return authOptionsFor(language).find((option) => option.value === mode)?.label ?? mode;
+}
+
+function preferredAuthModeForUrl(url: string, defaultAuthMode: AuthMode) {
+  if (isBilibiliUrl(url)) {
+    return "none" as AuthMode;
+  }
+
+  return defaultAuthMode;
+}
+
+function isBilibiliUrl(url: string) {
+  const lowercased = url.toLowerCase();
+  return lowercased.includes("bilibili.com/") || lowercased.includes("b23.tv/");
+}
+
+function detectPlaylistMode(url: string, defaultScope: PlaylistScope) {
   if (!url) {
-    return { showScopeSelector: false, defaultScope: "video" as PlaylistScope };
+    return { showScopeSelector: false, defaultScope };
   }
 
   try {
@@ -813,14 +1442,14 @@ function detectPlaylistMode(url: string) {
     const hasPlaylist = parsed.searchParams.has("list");
 
     if (hasVideo && hasPlaylist) {
-      return { showScopeSelector: true, defaultScope: "video" as PlaylistScope };
+      return { showScopeSelector: true, defaultScope };
     }
 
     if (hasPlaylist) {
       return { showScopeSelector: false, defaultScope: "playlist" as PlaylistScope };
     }
   } catch {
-    return { showScopeSelector: false, defaultScope: "video" as PlaylistScope };
+    return { showScopeSelector: false, defaultScope };
   }
 
   return { showScopeSelector: false, defaultScope: "video" as PlaylistScope };

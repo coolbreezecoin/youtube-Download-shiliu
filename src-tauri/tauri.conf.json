@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ytDownloader",
-  "version": "0.1.0",
+  "productName": "拾流下载器",
+  "version": "0.1.1",
   "identifier": "com.coolbreeze.ytdownloader",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "ytDownloader",
+        "title": "拾流下载器",
         "width": 1480,
         "height": 920,
         "minWidth": 1100,
@@ -26,6 +26,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "resources/ffmpeg-libs/": "ffmpeg-libs/"
+    },
+    "externalBin": [
+      "binaries/yt-dlp",
+      "binaries/ffmpeg",
+      "binaries/ffprobe",
+      "binaries/deno"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

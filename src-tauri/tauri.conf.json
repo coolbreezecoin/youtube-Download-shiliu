@@ -27,7 +27,8 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "resources/ffmpeg-libs/": "ffmpeg-libs/"
+      "resources/ffmpeg-libs/": "ffmpeg-libs/",
+      "resources/ffmpeg-libs-x86_64-apple-darwin/": "ffmpeg-libs-x86_64-apple-darwin/"
     },
     "externalBin": [
       "binaries/yt-dlp",

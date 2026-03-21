@@ -2502,14 +2502,23 @@ fn resolve_ffmpeg_library_dir() -> Option<PathBuf> {
 }
 
 fn ffmpeg_library_dir_candidates() -> Vec<PathBuf> {
+    let target_resource_dir = ffmpeg_resource_dir_name(current_target_triple());
     let mut candidates = Vec::new();
 
     if let Ok(current_exe) = env::current_exe() {
         if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join(format!("../Resources/{target_resource_dir}")));
             candidates.push(parent.join("../Resources/ffmpeg-libs"));
 
             if let Some(contents_dir) = parent.parent() {
+                candidates.push(contents_dir.join("Resources").join(&target_resource_dir));
                 candidates.push(contents_dir.join("Resources").join("ffmpeg-libs"));
+                candidates.push(
+                    contents_dir
+                        .join("Resources")
+                        .join("resources")
+                        .join(&target_resource_dir),
+                );
                 candidates.push(
                     contents_dir
                         .join("Resources")
@@ -2523,10 +2532,22 @@ fn ffmpeg_library_dir_candidates() -> Vec<PathBuf> {
     candidates.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
+            .join(&target_resource_dir),
+    );
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
             .join("ffmpeg-libs"),
     );
 
     candidates
+}
+
+fn ffmpeg_resource_dir_name(target_triple: &str) -> String {
+    match target_triple {
+        "x86_64-apple-darwin" => "ffmpeg-libs-x86_64-apple-darwin".into(),
+        _ => "ffmpeg-libs".into(),
+    }
 }
 
 fn bundled_binary_name(binary: &str) -> String {

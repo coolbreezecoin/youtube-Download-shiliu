@@ -107,7 +107,7 @@ export APPLE_API_KEY_PATH='/absolute/path/to/AuthKey_XXXXXXXXXX.p8'
 
 仓库已经包含工作流：
 
-- `.github/workflows/macos-release.yml`
+- `.github/workflows/multi-platform-release.yml`
 
 支持两种触发方式：
 
@@ -121,13 +121,9 @@ git push origin v0.1.1
 
 工作流会自动完成：
 
-- 导入 `Developer ID Application` 证书
-- 写入 `App Store Connect API Key`
-- 构建 `.app`
-- 补签 `ffmpeg-libs` 里的 `.dylib`
-- notarize `.app`
-- 打包并 notarize `.dmg`
-- 上传 `.dmg` 和 `.app.zip`
+- `macOS arm64`：导入 `Developer ID Application` 证书，notarize `.app/.dmg`
+- `macOS Intel`：自动拉取 Intel 版 sidecar 后再构建并 notarize
+- `Windows x64`：自动拉取 Windows 版 sidecar 后构建安装包并上传
 - 如果是 tag 触发，还会自动创建 GitHub Release
 
 ### 需要配置的 GitHub Secrets
@@ -204,10 +200,34 @@ docs/                需求文档
 
 ## 已知限制
 
-- 当前仓库只内置 `macOS arm64` 二进制
-- Windows / Intel Mac / Linux 还没有补齐对应 sidecar
+- 当前仓库默认提交的仍是 `macOS arm64` 二进制
+- `Intel Mac / Windows` 依赖在构建前通过脚本自动拉取，不再要求手动准备
+- `Linux` 还没有补齐对应 sidecar
 - 个别 YouTube 登录态链接可能受上游 challenge 影响
 - 浏览器 Cookie 相关能力依赖本机浏览器状态
+
+## Windows / Intel Mac 打包说明
+
+当前仓库已经具备多平台打包的代码结构，`Intel Mac` 和 `Windows x64` 的 sidecar 会在构建前自动拉取。
+
+如果你要本地先准备好资源，可以直接执行：
+
+```bash
+./scripts/fetch-platform-assets.sh x86_64-apple-darwin
+./scripts/fetch-platform-assets.sh x86_64-pc-windows-msvc
+```
+
+然后用下面的命令做检查：
+
+```bash
+./scripts/validate-platform-assets.sh x86_64-apple-darwin
+./scripts/validate-platform-assets.sh x86_64-pc-windows-msvc
+```
+
+资源就绪后：
+
+- `macOS Intel` 可以走本地 notarized 构建或 GitHub Actions
+- `Windows` 通过 GitHub Actions 直接产出安装包
 
 ## 法律与使用说明
 

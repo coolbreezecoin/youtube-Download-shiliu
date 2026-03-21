@@ -5,6 +5,45 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$(mktemp -d /tmp/shiliu-build.XXXXXX)"
 OUTPUT_DIR="$ROOT_DIR/release-artifacts"
+HOST_ARCH="$(uname -m)"
+
+case "${TARGET_TRIPLE:-}" in
+  "")
+    case "$HOST_ARCH" in
+      arm64)
+        TARGET_TRIPLE="aarch64-apple-darwin"
+        ARTIFACT_ARCH="aarch64"
+        ;;
+      x86_64)
+        TARGET_TRIPLE="x86_64-apple-darwin"
+        ARTIFACT_ARCH="x64"
+        ;;
+      *)
+        echo "Unsupported macOS host architecture: $HOST_ARCH" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  aarch64-apple-darwin)
+    ARTIFACT_ARCH="aarch64"
+    ;;
+  x86_64-apple-darwin)
+    ARTIFACT_ARCH="x64"
+    ;;
+  *)
+    echo "Unsupported TARGET_TRIPLE: ${TARGET_TRIPLE}" >&2
+    exit 1
+    ;;
+esac
+
+case "$TARGET_TRIPLE" in
+  x86_64-apple-darwin)
+    FFMPEG_LIB_DIR_NAME="ffmpeg-libs-x86_64-apple-darwin"
+    ;;
+  *)
+    FFMPEG_LIB_DIR_NAME="ffmpeg-libs"
+    ;;
+esac
 
 required_envs=(
   APPLE_SIGNING_IDENTITY
@@ -25,7 +64,12 @@ if [[ ! -f "$APPLE_API_KEY_PATH" ]]; then
   exit 1
 fi
 
+NOTARY_APPLE_API_ISSUER="$APPLE_API_ISSUER"
+NOTARY_APPLE_API_KEY="$APPLE_API_KEY"
+NOTARY_APPLE_API_KEY_PATH="$APPLE_API_KEY_PATH"
+
 echo "Using temporary build directory: $BUILD_DIR"
+echo "Target triple: $TARGET_TRIPLE"
 mkdir -p "$OUTPUT_DIR"
 
 cleanup() {
@@ -48,9 +92,17 @@ unset APPLE_API_ISSUER
 unset APPLE_API_KEY
 unset APPLE_API_KEY_PATH
 
-npm run tauri build
+if [[ "$TARGET_TRIPLE" == "x86_64-apple-darwin" ]]; then
+  bash scripts/fetch-platform-assets.sh "$TARGET_TRIPLE"
+fi
 
-APP_PATH="$(find "$BUILD_DIR/src-tauri/target/release/bundle/macos" -maxdepth 1 -name '*.app' -print -quit)"
+bash scripts/validate-platform-assets.sh "$TARGET_TRIPLE"
+
+npm run tauri build -- --target "$TARGET_TRIPLE"
+
+BUNDLE_DIR="$BUILD_DIR/src-tauri/target/$TARGET_TRIPLE/release/bundle"
+
+APP_PATH="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -print -quit)"
 if [[ -z "$APP_PATH" ]]; then
   echo "Signed app bundle not found after build." >&2
   exit 1
@@ -65,7 +117,7 @@ print(config["productName"])
 PY
 )"
 
-LIB_DIR="$APP_PATH/Contents/Resources/ffmpeg-libs"
+LIB_DIR="$APP_PATH/Contents/Resources/$FFMPEG_LIB_DIR_NAME"
 if [[ -d "$LIB_DIR" ]]; then
   while IFS= read -r -d '' dylib; do
     codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dylib"
@@ -75,27 +127,27 @@ fi
 codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime "$APP_PATH"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-ZIP_PATH="$BUILD_DIR/src-tauri/target/release/bundle/macos/${PRODUCT_NAME}-notarize.zip"
+ZIP_PATH="$BUNDLE_DIR/macos/${PRODUCT_NAME}-notarize.zip"
 rm -f "$ZIP_PATH"
 ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
 
 xcrun notarytool submit "$ZIP_PATH" \
-  --key "$APPLE_API_KEY_PATH" \
-  --key-id "$APPLE_API_KEY" \
-  --issuer "$APPLE_API_ISSUER" \
+  --key "$NOTARY_APPLE_API_KEY_PATH" \
+  --key-id "$NOTARY_APPLE_API_KEY" \
+  --issuer "$NOTARY_APPLE_API_ISSUER" \
   --wait
 
 xcrun stapler staple "$APP_PATH"
 
-DMG_PATH="$BUILD_DIR/src-tauri/target/release/bundle/dmg/${PRODUCT_NAME}_${VERSION}_aarch64_notarized.dmg"
+DMG_PATH="$BUNDLE_DIR/dmg/${PRODUCT_NAME}_${VERSION}_${ARTIFACT_ARCH}_notarized.dmg"
 mkdir -p "$(dirname "$DMG_PATH")"
 rm -f "$DMG_PATH"
 hdiutil create -volname "$PRODUCT_NAME" -srcfolder "$APP_PATH" -ov -format UDZO "$DMG_PATH"
 
 xcrun notarytool submit "$DMG_PATH" \
-  --key "$APPLE_API_KEY_PATH" \
-  --key-id "$APPLE_API_KEY" \
-  --issuer "$APPLE_API_ISSUER" \
+  --key "$NOTARY_APPLE_API_KEY_PATH" \
+  --key-id "$NOTARY_APPLE_API_KEY" \
+  --issuer "$NOTARY_APPLE_API_ISSUER" \
   --wait
 
 xcrun stapler staple "$DMG_PATH"

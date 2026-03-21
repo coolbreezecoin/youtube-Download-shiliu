@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 release-artifacts
+src-tauri/binaries/*x86_64-apple-darwin
+src-tauri/binaries/*x86_64-pc-windows-msvc.exe
+src-tauri/resources/ffmpeg-libs-x86_64-apple-darwin/*
+!src-tauri/resources/ffmpeg-libs-x86_64-apple-darwin/.gitkeep
 
 # Editor directories and files
 .vscode/*

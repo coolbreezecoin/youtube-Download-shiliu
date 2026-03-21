@@ -1,0 +1,178 @@
+name: Multi Platform Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-notarized:
+    name: macOS notarized (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            artifact_suffix: macos-aarch64-notarized
+          - label: Intel
+            runner: macos-13
+            target: x86_64-apple-darwin
+            artifact_suffix: macos-x64-notarized
+    env:
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_PATH: ${{ github.workspace }}/AuthKey.p8
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      TARGET_TRIPLE: ${{ matrix.target }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Fetch Intel Mac sidecars
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: bash scripts/fetch-platform-assets.sh "$TARGET_TRIPLE"
+
+      - name: Validate platform assets
+        id: validate_assets
+        continue-on-error: true
+        run: bash scripts/validate-platform-assets.sh "$TARGET_TRIPLE"
+
+      - name: Skip summary
+        if: steps.validate_assets.outcome != 'success'
+        run: echo "Skipping $TARGET_TRIPLE because required sidecar assets are not present."
+
+      - name: Create App Store Connect API key file
+        if: steps.validate_assets.outcome == 'success'
+        run: |
+          printf '%s' "${{ secrets.APPLE_API_KEY_P8 }}" > "$APPLE_API_KEY_PATH"
+          chmod 600 "$APPLE_API_KEY_PATH"
+
+      - name: Import Developer ID certificate
+        if: steps.validate_assets.outcome == 'success'
+        run: |
+          CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+
+          printf '%s' "${{ secrets.APPLE_CERTIFICATE_P12 }}" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Build notarized macOS artifacts
+        if: steps.validate_assets.outcome == 'success'
+        run: ./scripts/build-macos-notarized.sh
+
+      - name: Zip app bundle
+        if: steps.validate_assets.outcome == 'success'
+        run: |
+          APP_PATH="$(find release-artifacts -maxdepth 1 -name '*.app' -print -quit)"
+          if [[ -z "$APP_PATH" ]]; then
+            echo "Notarized app not found in release-artifacts" >&2
+            exit 1
+          fi
+          ditto -c -k --keepParent "$APP_PATH" "${APP_PATH}.zip"
+
+      - name: Upload build artifacts
+        if: steps.validate_assets.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_suffix }}
+          path: |
+            release-artifacts/*.dmg
+            release-artifacts/*.zip
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/') && steps.validate_assets.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*.dmg
+            release-artifacts/*.zip
+          append_body: true
+          generate_release_notes: true
+
+  build-windows:
+    name: Windows build
+    runs-on: windows-latest
+    env:
+      TARGET_TRIPLE: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Fetch Windows sidecars
+        shell: bash
+        run: bash scripts/fetch-platform-assets.sh "$TARGET_TRIPLE"
+
+      - name: Validate platform assets
+        id: validate_assets
+        continue-on-error: true
+        shell: bash
+        run: bash scripts/validate-platform-assets.sh "$TARGET_TRIPLE"
+
+      - name: Skip summary
+        if: steps.validate_assets.outcome != 'success'
+        shell: bash
+        run: echo "Skipping Windows build because required sidecar assets are not present."
+
+      - name: Build Windows artifacts
+        if: steps.validate_assets.outcome == 'success'
+        shell: bash
+        run: npm run tauri build -- --target "$TARGET_TRIPLE"
+
+      - name: Upload Windows artifacts
+        if: steps.validate_assets.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.exe
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/') && steps.validate_assets.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.exe
+          append_body: true

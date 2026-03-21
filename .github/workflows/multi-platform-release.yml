@@ -157,7 +157,7 @@ jobs:
       - name: Build Windows artifacts
         if: steps.validate_assets.outcome == 'success'
         shell: bash
-        run: npm run tauri build -- --target "$TARGET_TRIPLE"
+        run: npm run tauri build -- --target "$TARGET_TRIPLE" --bundles nsis
 
       - name: Upload Windows artifacts
         if: steps.validate_assets.outcome == 'success'
@@ -165,7 +165,6 @@ jobs:
         with:
           name: windows-x64
           path: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.msi
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.exe
 
       - name: Publish GitHub Release assets
@@ -173,6 +172,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.msi
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.exe
           append_body: true

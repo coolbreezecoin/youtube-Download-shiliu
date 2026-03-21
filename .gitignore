@@ -16,6 +16,8 @@ src-tauri/binaries/*x86_64-apple-darwin
 src-tauri/binaries/*x86_64-pc-windows-msvc.exe
 src-tauri/resources/ffmpeg-libs-x86_64-apple-darwin/*
 !src-tauri/resources/ffmpeg-libs-x86_64-apple-darwin/.gitkeep
+src-tauri/resources/python-runtime-aarch64-apple-darwin/*
+src-tauri/resources/python-runtime-x86_64-apple-darwin/*
 
 # Editor directories and files
 .vscode/*

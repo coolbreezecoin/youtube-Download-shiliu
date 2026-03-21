@@ -26,7 +26,7 @@ require_non_empty_dir() {
     return
   fi
 
-  if ! find "$path" -type f ! -name '.gitkeep' | grep -q .; then
+  if [[ -z "$(find "$path" -type f ! -name '.gitkeep' -print -quit)" ]]; then
     missing+=("$path (directory exists but contains no usable files)")
   fi
 }
@@ -37,6 +37,7 @@ case "$TARGET_TRIPLE" in
     require_file "$ROOT_DIR/src-tauri/binaries/ffmpeg-$TARGET_TRIPLE"
     require_file "$ROOT_DIR/src-tauri/binaries/ffprobe-$TARGET_TRIPLE"
     require_file "$ROOT_DIR/src-tauri/binaries/deno-$TARGET_TRIPLE"
+    require_non_empty_dir "$ROOT_DIR/src-tauri/resources/python-runtime-$TARGET_TRIPLE"
 
     if [[ "$TARGET_TRIPLE" == "aarch64-apple-darwin" ]]; then
       require_non_empty_dir "$ROOT_DIR/src-tauri/resources/ffmpeg-libs"

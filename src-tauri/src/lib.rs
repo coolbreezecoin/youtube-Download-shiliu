@@ -2435,6 +2435,21 @@ fn command_exists(binary: &str, args: &[&str]) -> bool {
 }
 
 fn binary_command(binary: &str) -> Command {
+    #[cfg(target_os = "macos")]
+    if binary == "yt-dlp" {
+        if let Some(script_path) = resolve_binary_path(binary) {
+            if let Some(python_path) = resolve_python_path() {
+                let mut command = Command::new(python_path);
+                if let Some(runtime_root) = resolve_python_runtime_root() {
+                    command.env("PYTHONHOME", runtime_root);
+                    command.env("PYTHONNOUSERSITE", "1");
+                }
+                command.arg(script_path);
+                return command;
+            }
+        }
+    }
+
     let mut command = resolve_binary_path(binary)
         .map(Command::new)
         .unwrap_or_else(|| Command::new(binary));
@@ -2501,6 +2516,77 @@ fn resolve_ffmpeg_library_dir() -> Option<PathBuf> {
         .find(|path| path.is_dir())
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_python_path() -> Option<PathBuf> {
+    python_runtime_root_candidates()
+        .into_iter()
+        .map(|root| root.join("bin").join("python3"))
+        .find(|path| path.is_file())
+        .or_else(|| {
+            if command_exists("python3", &["--version"]) {
+                Some(PathBuf::from("python3"))
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_python_path() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_python_runtime_root() -> Option<PathBuf> {
+    python_runtime_root_candidates()
+        .into_iter()
+        .find(|path| path.is_dir())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_python_runtime_root() -> Option<PathBuf> {
+    None
+}
+
+fn python_runtime_root_candidates() -> Vec<PathBuf> {
+    let target_resource_dir = python_runtime_dir_name(current_target_triple());
+    let mut candidates = Vec::new();
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join(format!("../Resources/{target_resource_dir}/python")));
+            candidates.push(parent.join(format!(
+                "../Resources/resources/{target_resource_dir}/python"
+            )));
+
+            if let Some(contents_dir) = parent.parent() {
+                candidates.push(
+                    contents_dir
+                        .join("Resources")
+                        .join(&target_resource_dir)
+                        .join("python"),
+                );
+                candidates.push(
+                    contents_dir
+                        .join("Resources")
+                        .join("resources")
+                        .join(&target_resource_dir)
+                        .join("python"),
+                );
+            }
+        }
+    }
+
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(&target_resource_dir)
+            .join("python"),
+    );
+
+    candidates
+}
+
 fn ffmpeg_library_dir_candidates() -> Vec<PathBuf> {
     let target_resource_dir = ffmpeg_resource_dir_name(current_target_triple());
     let mut candidates = Vec::new();
@@ -2547,6 +2633,13 @@ fn ffmpeg_resource_dir_name(target_triple: &str) -> String {
     match target_triple {
         "x86_64-apple-darwin" => "ffmpeg-libs-x86_64-apple-darwin".into(),
         _ => "ffmpeg-libs".into(),
+    }
+}
+
+fn python_runtime_dir_name(target_triple: &str) -> String {
+    match target_triple {
+        "x86_64-apple-darwin" => "python-runtime-x86_64-apple-darwin".into(),
+        _ => "python-runtime-aarch64-apple-darwin".into(),
     }
 }
 

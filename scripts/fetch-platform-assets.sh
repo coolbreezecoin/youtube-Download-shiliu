@@ -14,6 +14,8 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 DENO_VERSION="${DENO_VERSION:-$(curl -fsSL https://dl.deno.land/release-latest.txt)}"
+PYTHON_STANDALONE_RELEASE="${PYTHON_STANDALONE_RELEASE:-20260320}"
+PYTHON_STANDALONE_VERSION="${PYTHON_STANDALONE_VERSION:-3.12.13}"
 
 if [[ -z "$PYTHON_BIN" ]]; then
   echo "Python is required to extract release archives." >&2
@@ -67,14 +69,13 @@ prepare_macos_x64() {
   local ffmpeg_path="$ROOT_DIR/src-tauri/binaries/ffmpeg-x86_64-apple-darwin"
   local ffprobe_path="$ROOT_DIR/src-tauri/binaries/ffprobe-x86_64-apple-darwin"
   local deno_path="$ROOT_DIR/src-tauri/binaries/deno-x86_64-apple-darwin"
+  local python_dir="$ROOT_DIR/src-tauri/resources/python-runtime-x86_64-apple-darwin"
 
   ensure_parent "$yt_dlp_path"
 
-  if ! have_file "$yt_dlp_path"; then
-    echo "Fetching yt-dlp for Intel Mac..."
-    download "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" "$yt_dlp_path"
-    chmod +x "$yt_dlp_path"
-  fi
+  echo "Fetching yt-dlp script for Intel Mac..."
+  download "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" "$yt_dlp_path"
+  chmod +x "$yt_dlp_path"
 
   if ! have_file "$ffmpeg_path"; then
     echo "Fetching ffmpeg for Intel Mac..."
@@ -95,6 +96,37 @@ prepare_macos_x64() {
     download "https://dl.deno.land/release/$DENO_VERSION/deno-x86_64-apple-darwin.zip" "$TMP_DIR/deno-macos-x64.zip"
     extract_zip_entry "$TMP_DIR/deno-macos-x64.zip" "deno" "$deno_path"
     chmod +x "$deno_path"
+  fi
+
+  if [[ ! -x "$python_dir/python/bin/python3" ]]; then
+    echo "Fetching Python runtime for Intel Mac..."
+    rm -rf "$python_dir"
+    mkdir -p "$python_dir"
+    download \
+      "https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_STANDALONE_RELEASE/cpython-$PYTHON_STANDALONE_VERSION%2B$PYTHON_STANDALONE_RELEASE-x86_64-apple-darwin-install_only_stripped.tar.gz" \
+      "$TMP_DIR/python-macos-x64.tar.gz"
+    tar -xzf "$TMP_DIR/python-macos-x64.tar.gz" -C "$python_dir"
+  fi
+}
+
+prepare_macos_arm64() {
+  local yt_dlp_path="$ROOT_DIR/src-tauri/binaries/yt-dlp-aarch64-apple-darwin"
+  local python_dir="$ROOT_DIR/src-tauri/resources/python-runtime-aarch64-apple-darwin"
+
+  ensure_parent "$yt_dlp_path"
+
+  echo "Fetching yt-dlp script for Apple Silicon Mac..."
+  download "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" "$yt_dlp_path"
+  chmod +x "$yt_dlp_path"
+
+  if [[ ! -x "$python_dir/python/bin/python3" ]]; then
+    echo "Fetching Python runtime for Apple Silicon Mac..."
+    rm -rf "$python_dir"
+    mkdir -p "$python_dir"
+    download \
+      "https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_STANDALONE_RELEASE/cpython-$PYTHON_STANDALONE_VERSION%2B$PYTHON_STANDALONE_RELEASE-aarch64-apple-darwin-install_only_stripped.tar.gz" \
+      "$TMP_DIR/python-macos-arm64.tar.gz"
+    tar -xzf "$TMP_DIR/python-macos-arm64.tar.gz" -C "$python_dir"
   fi
 }
 
@@ -126,6 +158,9 @@ prepare_windows_x64() {
 }
 
 case "$TARGET_TRIPLE" in
+  aarch64-apple-darwin)
+    prepare_macos_arm64
+    ;;
   x86_64-apple-darwin)
     prepare_macos_x64
     ;;

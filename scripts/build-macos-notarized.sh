@@ -39,9 +39,11 @@ esac
 case "$TARGET_TRIPLE" in
   x86_64-apple-darwin)
     FFMPEG_LIB_DIR_NAME="ffmpeg-libs-x86_64-apple-darwin"
+    PYTHON_RUNTIME_DIR_NAME="python-runtime-x86_64-apple-darwin"
     ;;
   *)
     FFMPEG_LIB_DIR_NAME="ffmpeg-libs"
+    PYTHON_RUNTIME_DIR_NAME="python-runtime-aarch64-apple-darwin"
     ;;
 esac
 
@@ -87,14 +89,23 @@ xattr -cr "$BUILD_DIR"
 
 pushd "$BUILD_DIR" >/dev/null
 
+case "$TARGET_TRIPLE" in
+  aarch64-apple-darwin)
+    rm -rf src-tauri/resources/python-runtime-x86_64-apple-darwin
+    mkdir -p src-tauri/resources/python-runtime-x86_64-apple-darwin
+    ;;
+  x86_64-apple-darwin)
+    rm -rf src-tauri/resources/python-runtime-aarch64-apple-darwin
+    mkdir -p src-tauri/resources/python-runtime-aarch64-apple-darwin
+    ;;
+esac
+
 export APPLE_SIGNING_IDENTITY
 unset APPLE_API_ISSUER
 unset APPLE_API_KEY
 unset APPLE_API_KEY_PATH
 
-if [[ "$TARGET_TRIPLE" == "x86_64-apple-darwin" ]]; then
-  bash scripts/fetch-platform-assets.sh "$TARGET_TRIPLE"
-fi
+bash scripts/fetch-platform-assets.sh "$TARGET_TRIPLE"
 
 bash scripts/validate-platform-assets.sh "$TARGET_TRIPLE"
 
@@ -122,6 +133,19 @@ if [[ -d "$LIB_DIR" ]]; then
   while IFS= read -r -d '' dylib; do
     codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dylib"
   done < <(find "$LIB_DIR" -type f -name '*.dylib' -print0)
+fi
+
+PYTHON_RUNTIME_DIR="$(find "$APP_PATH/Contents/Resources" -type d -name "$PYTHON_RUNTIME_DIR_NAME" -print -quit)"
+if [[ -n "$PYTHON_RUNTIME_DIR" ]]; then
+  while IFS= read -r -d '' macho; do
+    if file -b "$macho" | grep -q 'Mach-O'; then
+      if [[ -x "$macho" && "$macho" != *.dylib && "$macho" != *.so ]]; then
+        codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime "$macho"
+      else
+        codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$macho"
+      fi
+    fi
+  done < <(find "$PYTHON_RUNTIME_DIR" -type f -print0)
 fi
 
 codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime "$APP_PATH"

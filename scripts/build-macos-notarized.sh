@@ -7,6 +7,10 @@ BUILD_DIR="$(mktemp -d /tmp/shiliu-build.XXXXXX)"
 OUTPUT_DIR="$ROOT_DIR/release-artifacts"
 HOST_ARCH="$(uname -m)"
 
+if [[ -d "/opt/homebrew/opt/rustup/bin" ]]; then
+  export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+fi
+
 case "${TARGET_TRIPLE:-}" in
   "")
     case "$HOST_ARCH" in
@@ -97,6 +101,8 @@ case "$TARGET_TRIPLE" in
   x86_64-apple-darwin)
     rm -rf src-tauri/resources/python-runtime-aarch64-apple-darwin
     mkdir -p src-tauri/resources/python-runtime-aarch64-apple-darwin
+    rm -rf src-tauri/resources/ffmpeg-libs
+    mkdir -p src-tauri/resources/ffmpeg-libs
     ;;
 esac
 

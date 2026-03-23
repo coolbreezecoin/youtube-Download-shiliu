@@ -40,17 +40,6 @@ case "${TARGET_TRIPLE:-}" in
     ;;
 esac
 
-case "$TARGET_TRIPLE" in
-  x86_64-apple-darwin)
-    FFMPEG_LIB_DIR_NAME="ffmpeg-libs-x86_64-apple-darwin"
-    PYTHON_RUNTIME_DIR_NAME="python-runtime-x86_64-apple-darwin"
-    ;;
-  *)
-    FFMPEG_LIB_DIR_NAME="ffmpeg-libs"
-    PYTHON_RUNTIME_DIR_NAME="python-runtime-aarch64-apple-darwin"
-    ;;
-esac
-
 required_envs=(
   APPLE_SIGNING_IDENTITY
   APPLE_API_ISSUER
@@ -83,6 +72,56 @@ cleanup() {
 }
 trap cleanup EXIT
 
+python_runtime_dir_name() {
+  case "$1" in
+    x86_64-apple-darwin)
+      echo "python-runtime-x86_64-apple-darwin"
+      ;;
+    *)
+      echo "python-runtime-aarch64-apple-darwin"
+      ;;
+  esac
+}
+
+ffmpeg_resource_dir_name() {
+  case "$1" in
+    x86_64-apple-darwin)
+      echo "ffmpeg-libs-x86_64-apple-darwin"
+      ;;
+    *)
+      echo "ffmpeg-libs"
+      ;;
+  esac
+}
+
+sign_macho_tree() {
+  local tree_root="$1"
+
+  if [[ ! -d "$tree_root" ]]; then
+    return
+  fi
+
+  while IFS= read -r -d '' target; do
+    local description
+    description="$(file -b "$target")"
+
+    if [[ "$description" != *Mach-O* ]]; then
+      continue
+    fi
+
+    if [[ "$target" == *.dylib || "$target" == *.so ]]; then
+      codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$target"
+      continue
+    fi
+
+    if [[ "$target" == *"/bin/"* || -x "$target" ]]; then
+      codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime "$target"
+    else
+      codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$target"
+    fi
+  done < <(find "$tree_root" -type f -print0)
+}
+
 rsync -a \
   --exclude ".git" \
   --exclude "src-tauri/target" \
@@ -92,19 +131,6 @@ rsync -a \
 xattr -cr "$BUILD_DIR"
 
 pushd "$BUILD_DIR" >/dev/null
-
-case "$TARGET_TRIPLE" in
-  aarch64-apple-darwin)
-    rm -rf src-tauri/resources/python-runtime-x86_64-apple-darwin
-    mkdir -p src-tauri/resources/python-runtime-x86_64-apple-darwin
-    ;;
-  x86_64-apple-darwin)
-    rm -rf src-tauri/resources/python-runtime-aarch64-apple-darwin
-    mkdir -p src-tauri/resources/python-runtime-aarch64-apple-darwin
-    rm -rf src-tauri/resources/ffmpeg-libs
-    mkdir -p src-tauri/resources/ffmpeg-libs
-    ;;
-esac
 
 export APPLE_SIGNING_IDENTITY
 unset APPLE_API_ISSUER
@@ -125,6 +151,27 @@ if [[ -z "$APP_PATH" ]]; then
   exit 1
 fi
 
+SIGNED_APP_PATH="$BUILD_DIR/notarize/$(basename "$APP_PATH")"
+rm -rf "$SIGNED_APP_PATH"
+mkdir -p "$(dirname "$SIGNED_APP_PATH")"
+ditto "$APP_PATH" "$SIGNED_APP_PATH"
+xattr -cr "$SIGNED_APP_PATH"
+
+TARGET_PYTHON_RUNTIME="$(python_runtime_dir_name "$TARGET_TRIPLE")"
+TARGET_FFMPEG_LIBS="$(ffmpeg_resource_dir_name "$TARGET_TRIPLE")"
+RESOURCES_DIR="$SIGNED_APP_PATH/Contents/Resources"
+
+find "$RESOURCES_DIR" -maxdepth 1 -type d -name 'python-runtime-*' ! -name "$TARGET_PYTHON_RUNTIME" -exec rm -rf {} +
+
+if [[ "$TARGET_FFMPEG_LIBS" == "ffmpeg-libs" ]]; then
+  rm -rf "$RESOURCES_DIR/ffmpeg-libs-x86_64-apple-darwin"
+else
+  rm -rf "$RESOURCES_DIR/ffmpeg-libs"
+fi
+
+sign_macho_tree "$RESOURCES_DIR/$TARGET_PYTHON_RUNTIME"
+sign_macho_tree "$RESOURCES_DIR/$TARGET_FFMPEG_LIBS"
+
 VERSION="$(node -p "require('./package.json').version")"
 PRODUCT_NAME="$(python3 - <<'PY'
 import json
@@ -134,32 +181,12 @@ print(config["productName"])
 PY
 )"
 
-LIB_DIR="$APP_PATH/Contents/Resources/$FFMPEG_LIB_DIR_NAME"
-if [[ -d "$LIB_DIR" ]]; then
-  while IFS= read -r -d '' dylib; do
-    codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dylib"
-  done < <(find "$LIB_DIR" -type f -name '*.dylib' -print0)
-fi
-
-PYTHON_RUNTIME_DIR="$(find "$APP_PATH/Contents/Resources" -type d -name "$PYTHON_RUNTIME_DIR_NAME" -print -quit)"
-if [[ -n "$PYTHON_RUNTIME_DIR" ]]; then
-  while IFS= read -r -d '' macho; do
-    if file -b "$macho" | grep -q 'Mach-O'; then
-      if [[ -x "$macho" && "$macho" != *.dylib && "$macho" != *.so ]]; then
-        codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime "$macho"
-      else
-        codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$macho"
-      fi
-    fi
-  done < <(find "$PYTHON_RUNTIME_DIR" -type f -print0)
-fi
-
-codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime "$APP_PATH"
-codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+codesign --force --deep --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime "$SIGNED_APP_PATH"
+codesign --verify --deep --strict --verbose=2 "$SIGNED_APP_PATH"
 
 ZIP_PATH="$BUNDLE_DIR/macos/${PRODUCT_NAME}-notarize.zip"
 rm -f "$ZIP_PATH"
-ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+ditto -c -k --keepParent "$SIGNED_APP_PATH" "$ZIP_PATH"
 
 xcrun notarytool submit "$ZIP_PATH" \
   --key "$NOTARY_APPLE_API_KEY_PATH" \
@@ -167,12 +194,16 @@ xcrun notarytool submit "$ZIP_PATH" \
   --issuer "$NOTARY_APPLE_API_ISSUER" \
   --wait
 
-xcrun stapler staple "$APP_PATH"
+xcrun stapler staple "$SIGNED_APP_PATH"
 
 DMG_PATH="$BUNDLE_DIR/dmg/${PRODUCT_NAME}_${VERSION}_${ARTIFACT_ARCH}_notarized.dmg"
-mkdir -p "$(dirname "$DMG_PATH")"
+STAGING_DIR="$BUILD_DIR/dmg-staging"
+rm -rf "$STAGING_DIR"
+mkdir -p "$STAGING_DIR"
+ditto "$SIGNED_APP_PATH" "$STAGING_DIR/$(basename "$SIGNED_APP_PATH")"
 rm -f "$DMG_PATH"
-hdiutil create -volname "$PRODUCT_NAME" -srcfolder "$APP_PATH" -ov -format UDZO "$DMG_PATH"
+hdiutil create -volname "$PRODUCT_NAME" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
+codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG_PATH"
 
 xcrun notarytool submit "$DMG_PATH" \
   --key "$NOTARY_APPLE_API_KEY_PATH" \
@@ -182,14 +213,16 @@ xcrun notarytool submit "$DMG_PATH" \
 
 xcrun stapler staple "$DMG_PATH"
 
-spctl -a -vv "$APP_PATH"
+spctl -a -vv "$SIGNED_APP_PATH"
 
-cp -R "$APP_PATH" "$OUTPUT_DIR/"
+rm -rf "$OUTPUT_DIR/$(basename "$SIGNED_APP_PATH")"
+rm -f "$OUTPUT_DIR/$(basename "$DMG_PATH")"
+ditto "$SIGNED_APP_PATH" "$OUTPUT_DIR/$(basename "$SIGNED_APP_PATH")"
 cp "$DMG_PATH" "$OUTPUT_DIR/"
 
 popd >/dev/null
 
 echo
 echo "Finished."
-echo "App: $OUTPUT_DIR/$(basename "$APP_PATH")"
+echo "App: $OUTPUT_DIR/$(basename "$SIGNED_APP_PATH")"
 echo "DMG: $OUTPUT_DIR/$(basename "$DMG_PATH")"

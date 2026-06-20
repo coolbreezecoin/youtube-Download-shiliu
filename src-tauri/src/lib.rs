@@ -6,11 +6,14 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
+
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
+static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct AppState {
@@ -18,33 +21,20 @@ struct AppState {
     task_requests: Arc<Mutex<HashMap<String, StartDownloadRequest>>>,
     task_pids: Arc<Mutex<HashMap<String, u32>>>,
     cancelled_tasks: Arc<Mutex<HashSet<String>>>,
+    download_gate: Arc<(Mutex<usize>, Condvar)>,
     history: Arc<Mutex<Vec<HistoryItem>>>,
     settings: Arc<Mutex<AppSettings>>,
     state_path: PathBuf,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EnvironmentCheck {
-    id: String,
-    label: String,
-    status: String,
-    version: Option<String>,
-    detail: String,
-    required: bool,
-    auto_install_available: bool,
-    auto_install_label: Option<String>,
-    manual_install_hint: Option<String>,
+struct DownloadPermit {
+    gate: Arc<(Mutex<usize>, Condvar)>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EnvironmentSnapshot {
-    checks: Vec<EnvironmentCheck>,
-    recommended_output_dir: String,
-    note: String,
-    installer_available: bool,
-    installer_name: Option<String>,
+impl Drop for DownloadPermit {
+    fn drop(&mut self) {
+        release_download_permit(&self.gate);
+    }
 }
 
 #[derive(Serialize)]
@@ -211,6 +201,7 @@ fn load_app_state() -> AppState {
         task_requests: Arc::new(Mutex::new(persisted.task_requests)),
         task_pids: Arc::new(Mutex::new(HashMap::new())),
         cancelled_tasks: Arc::new(Mutex::new(HashSet::new())),
+        download_gate: Arc::new((Mutex::new(MAX_CONCURRENT_DOWNLOADS), Condvar::new())),
         history: Arc::new(Mutex::new(persisted.history)),
         settings: Arc::new(Mutex::new(sanitized_settings)),
         state_path,
@@ -230,6 +221,10 @@ fn default_settings() -> AppSettings {
 }
 
 fn persistence_path() -> PathBuf {
+    if let Some(config_dir) = dirs::config_dir() {
+        return config_dir.join("ytDownloader").join("state.json");
+    }
+
     let home = env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home)
         .join(".config")
@@ -318,646 +313,6 @@ fn message_unfinished_after_restart(language: &str) -> String {
     }
 }
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct InstallProgressEvent {
-    status: String,
-    progress: f32,
-    current_formula: Option<String>,
-    current_step: usize,
-    total_steps: usize,
-    message: String,
-}
-
-#[tauri::command]
-fn detect_environment() -> EnvironmentSnapshot {
-    build_environment_snapshot()
-}
-
-#[tauri::command]
-fn install_dependency(dependency_id: String) -> Result<EnvironmentSnapshot, String> {
-    if !command_exists("brew", &["--version"]) {
-        return Err("未检测到 Homebrew。请先手动安装 Homebrew，再按提示安装缺失依赖。".into());
-    }
-
-    let formula = brew_formula(&dependency_id)
-        .ok_or_else(|| format!("暂不支持自动安装 `{dependency_id}`"))?;
-
-    let output = Command::new("brew")
-        .args(["install", formula])
-        .output()
-        .map_err(|error| format!("无法启动 Homebrew 安装 `{formula}`：{error}"))?;
-
-    if !output.status.success() {
-        return Err(command_error(&output.stderr, &output.stdout));
-    }
-
-    Ok(build_environment_snapshot())
-}
-
-#[tauri::command]
-fn install_missing_dependencies(app: AppHandle) -> Result<EnvironmentSnapshot, String> {
-    if !command_exists("brew", &["--version"]) {
-        return Err("未检测到 Homebrew。请先手动安装 Homebrew，再按提示安装缺失依赖。".into());
-    }
-
-    let snapshot = build_environment_snapshot();
-    let mut formulas = Vec::new();
-
-    if snapshot
-        .checks
-        .iter()
-        .any(|check| check.id == "yt-dlp" && check.status != "ready")
-    {
-        formulas.push("yt-dlp");
-    }
-
-    if snapshot
-        .checks
-        .iter()
-        .any(|check| check.id == "ffmpeg" && check.status != "ready")
-    {
-        formulas.push("ffmpeg");
-    }
-
-    let stronger_runtime_ready = snapshot.checks.iter().any(|check| {
-        ["deno", "bun", "qjs"].contains(&check.id.as_str()) && check.status == "ready"
-    });
-
-    if !stronger_runtime_ready {
-        formulas.push(brew_formula("bun").unwrap_or("oven-sh/bun/bun"));
-    }
-
-    if formulas.is_empty() {
-        return Ok(snapshot);
-    }
-
-    emit_install_progress(
-        &app,
-        InstallProgressEvent {
-            status: "running".into(),
-            progress: 3.0,
-            current_formula: None,
-            current_step: 0,
-            total_steps: formulas.len(),
-            message: "正在准备安装缺失依赖...".into(),
-        },
-    );
-
-    for (index, formula) in formulas.iter().enumerate() {
-        install_formula_with_progress(&app, formula, index, formulas.len())?;
-    }
-
-    let next_snapshot = build_environment_snapshot();
-    emit_install_progress(
-        &app,
-        InstallProgressEvent {
-            status: "done".into(),
-            progress: 100.0,
-            current_formula: None,
-            current_step: formulas.len(),
-            total_steps: formulas.len(),
-            message: "缺失依赖安装完成。".into(),
-        },
-    );
-
-    Ok(next_snapshot)
-}
-
-fn install_formula_with_progress(
-    app: &AppHandle,
-    formula: &str,
-    index: usize,
-    total_steps: usize,
-) -> Result<(), String> {
-    let label = formula_label(formula).to_string();
-    let current_step = index + 1;
-    let current_progress = Arc::new(Mutex::new(overall_install_progress(
-        index,
-        total_steps,
-        0.08,
-    )));
-    let last_message = Arc::new(Mutex::new(format!("开始安装 {label}...")));
-    let is_finished = Arc::new(AtomicBool::new(false));
-
-    emit_install_progress(
-        app,
-        InstallProgressEvent {
-            status: "running".into(),
-            progress: *current_progress
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            current_formula: Some(label.clone()),
-            current_step,
-            total_steps,
-            message: format!("开始安装 {label}..."),
-        },
-    );
-
-    if formula == "oven-sh/bun/bun" && !tap_exists("oven-sh/bun") {
-        emit_install_progress(
-            app,
-            InstallProgressEvent {
-                status: "running".into(),
-                progress: overall_install_progress(index, total_steps, 0.14),
-                current_formula: Some(label.clone()),
-                current_step,
-                total_steps,
-                message: "正在准备 Bun tap...".into(),
-            },
-        );
-
-        run_brew_setup_step(
-            app,
-            "tap",
-            &["tap", "oven-sh/bun"],
-            &label,
-            index,
-            total_steps,
-        )?;
-    }
-
-    let mut child = brew_command()
-        .args(["install", formula])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("无法启动 Homebrew 安装 `{formula}`：{error}"))?;
-
-    let stdout_handle = child.stdout.take().map(|stdout| {
-        spawn_install_output_reader(
-            app.clone(),
-            stdout,
-            label.clone(),
-            index,
-            total_steps,
-            Arc::clone(&current_progress),
-            Arc::clone(&last_message),
-            Arc::clone(&is_finished),
-        )
-    });
-
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        spawn_install_output_reader(
-            app.clone(),
-            stderr,
-            label.clone(),
-            index,
-            total_steps,
-            Arc::clone(&current_progress),
-            Arc::clone(&last_message),
-            Arc::clone(&is_finished),
-        )
-    });
-
-    let heartbeat_handle = spawn_install_heartbeat(
-        app.clone(),
-        label.clone(),
-        index,
-        total_steps,
-        Arc::clone(&current_progress),
-        Arc::clone(&last_message),
-        Arc::clone(&is_finished),
-    );
-
-    let status = child
-        .wait()
-        .map_err(|error| format!("等待 Homebrew 安装 `{formula}` 结束失败：{error}"))?;
-
-    is_finished.store(true, Ordering::Relaxed);
-
-    if let Some(handle) = stdout_handle {
-        let _ = handle.join();
-    }
-
-    if let Some(handle) = stderr_handle {
-        let _ = handle.join();
-    }
-
-    let _ = heartbeat_handle.join();
-
-    if !status.success() {
-        let message = last_message
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let progress = *current_progress
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        emit_install_progress(
-            app,
-            InstallProgressEvent {
-                status: "failed".into(),
-                progress,
-                current_formula: Some(label),
-                current_step,
-                total_steps,
-                message: format!("安装失败：{message}"),
-            },
-        );
-
-        return Err(message);
-    }
-
-    emit_install_progress(
-        app,
-        InstallProgressEvent {
-            status: "running".into(),
-            progress: overall_install_progress(index, total_steps, 1.0),
-            current_formula: Some(label.clone()),
-            current_step,
-            total_steps,
-            message: format!("{label} 安装完成。"),
-        },
-    );
-
-    Ok(())
-}
-
-fn run_brew_setup_step(
-    app: &AppHandle,
-    action_label: &str,
-    args: &[&str],
-    install_label: &str,
-    index: usize,
-    total_steps: usize,
-) -> Result<(), String> {
-    let output = brew_command()
-        .args(args)
-        .output()
-        .map_err(|error| format!("无法启动 Homebrew {action_label}：{error}"))?;
-
-    if !output.status.success() {
-        emit_install_progress(
-            app,
-            InstallProgressEvent {
-                status: "failed".into(),
-                progress: overall_install_progress(index, total_steps, 0.14),
-                current_formula: Some(install_label.to_string()),
-                current_step: index + 1,
-                total_steps,
-                message: format!(
-                    "准备 {install_label} 失败：{}",
-                    command_error(&output.stderr, &output.stdout)
-                ),
-            },
-        );
-
-        return Err(command_error(&output.stderr, &output.stdout));
-    }
-
-    Ok(())
-}
-
-fn spawn_install_output_reader<R: Read + Send + 'static>(
-    app: AppHandle,
-    reader: R,
-    label: String,
-    index: usize,
-    total_steps: usize,
-    current_progress: Arc<Mutex<f32>>,
-    last_message: Arc<Mutex<String>>,
-    is_finished: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let reader = BufReader::new(reader);
-
-        for line in reader.lines().map_while(Result::ok) {
-            if is_finished.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let message = install_message(trimmed, &label);
-            let next_progress = install_progress_from_line(trimmed, index, total_steps)
-                .unwrap_or_else(|| {
-                    *current_progress
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                });
-
-            {
-                let mut progress = current_progress
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if next_progress > *progress {
-                    *progress = next_progress;
-                }
-            }
-
-            {
-                let mut last = last_message
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *last = message.clone();
-            }
-
-            emit_install_progress(
-                &app,
-                InstallProgressEvent {
-                    status: "running".into(),
-                    progress: *current_progress
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                    current_formula: Some(label.clone()),
-                    current_step: index + 1,
-                    total_steps,
-                    message,
-                },
-            );
-        }
-    })
-}
-
-fn spawn_install_heartbeat(
-    app: AppHandle,
-    label: String,
-    index: usize,
-    total_steps: usize,
-    current_progress: Arc<Mutex<f32>>,
-    last_message: Arc<Mutex<String>>,
-    is_finished: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        while !is_finished.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_secs(1));
-
-            if is_finished.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let progress = {
-                let mut current = current_progress
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let floor = overall_install_progress(index, total_steps, 0.16);
-                let ceiling = overall_install_progress(index, total_steps, 0.92);
-                let next = (*current + 1.8).max(floor).min(ceiling);
-                *current = next;
-                next
-            };
-
-            let message = {
-                let last = last_message
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                if last.contains("仍在安装") {
-                    last
-                } else {
-                    format!("{label} 仍在安装，请稍候...")
-                }
-            };
-
-            emit_install_progress(
-                &app,
-                InstallProgressEvent {
-                    status: "running".into(),
-                    progress,
-                    current_formula: Some(label.clone()),
-                    current_step: index + 1,
-                    total_steps,
-                    message,
-                },
-            );
-        }
-    })
-}
-
-fn emit_install_progress(app: &AppHandle, payload: InstallProgressEvent) {
-    let _ = app.emit("install-progress-updated", payload);
-}
-
-fn overall_install_progress(index: usize, total_steps: usize, step_progress: f32) -> f32 {
-    if total_steps == 0 {
-        return 100.0;
-    }
-
-    (((index as f32) + step_progress.clamp(0.0, 1.0)) / total_steps as f32) * 100.0
-}
-
-fn install_progress_from_line(line: &str, index: usize, total_steps: usize) -> Option<f32> {
-    let normalized = line.to_lowercase();
-    let step_progress = if normalized.contains("downloading")
-        || normalized.contains("fetching")
-        || normalized.contains("curl")
-    {
-        0.22
-    } else if normalized.contains("installing")
-        || normalized.contains("building")
-        || normalized.contains("compiling")
-    {
-        0.58
-    } else if normalized.contains("pouring") || normalized.contains("moving") {
-        0.78
-    } else if normalized.contains("linking") || normalized.contains("caveats") {
-        0.9
-    } else if normalized.contains("summary")
-        || normalized.contains("installed")
-        || normalized.contains("already installed")
-    {
-        0.98
-    } else {
-        return None;
-    };
-
-    Some(overall_install_progress(index, total_steps, step_progress))
-}
-
-fn install_message(line: &str, label: &str) -> String {
-    let normalized = line.trim();
-
-    if normalized.to_lowercase().contains("already installed") {
-        return format!("{label} 已安装，正在校验状态。");
-    }
-
-    normalized
-        .strip_prefix("==>")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| normalized.to_string())
-}
-
-fn formula_label(formula: &str) -> &'static str {
-    match formula {
-        "yt-dlp" => "yt-dlp",
-        "ffmpeg" => "FFmpeg",
-        "bun" | "oven-sh/bun/bun" => "Bun",
-        "node" => "Node.js",
-        _ => "依赖项",
-    }
-}
-
-fn brew_formula(dependency_id: &str) -> Option<&'static str> {
-    match dependency_id {
-        "yt-dlp" => Some("yt-dlp"),
-        "ffmpeg" => Some("ffmpeg"),
-        "node" => Some("node"),
-        "bun" => Some("oven-sh/bun/bun"),
-        _ => None,
-    }
-}
-
-fn brew_command() -> Command {
-    let mut command = Command::new("brew");
-    command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
-    command.env("HOMEBREW_NO_ENV_HINTS", "1");
-    command
-}
-
-fn tap_exists(tap: &str) -> bool {
-    brew_command()
-        .args(["tap"])
-        .output()
-        .map(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line.trim() == tap)
-        })
-        .unwrap_or(false)
-}
-
-fn build_environment_snapshot() -> EnvironmentSnapshot {
-    let brew_available = command_exists("brew", &["--version"]);
-    let bundled_core_ready = ["yt-dlp", "ffmpeg", "ffprobe"]
-        .iter()
-        .all(|binary| resolve_binary_path(binary).is_some());
-    let yt_dlp = binary_check(
-        "yt-dlp",
-        "yt-dlp",
-        &["--version"],
-        true,
-        "下载内核。缺失时无法解析链接或执行下载。",
-        if brew_available { Some("yt-dlp") } else { None },
-        Some("手动安装：brew install yt-dlp"),
-    );
-    let ffmpeg = binary_check(
-        "ffmpeg",
-        "ffmpeg",
-        &["-version"],
-        true,
-        "音视频合并、转码、封面嵌入依赖 ffmpeg。",
-        if brew_available { Some("ffmpeg") } else { None },
-        Some("手动安装：brew install ffmpeg"),
-    );
-    let ffprobe = binary_check(
-        "ffprobe",
-        "ffprobe",
-        &["-version"],
-        false,
-        "用于媒体信息探测与部分后处理。",
-        None,
-        None,
-    );
-
-    let runtime_candidates = vec![
-        binary_check(
-            "node",
-            "Node.js",
-            &["--version"],
-            false,
-            "可作为 YouTube 支持的外部 JavaScript runtime。",
-            if brew_available { Some("node") } else { None },
-            Some("手动安装：brew install node"),
-        ),
-        binary_check(
-            "deno",
-            "Deno",
-            &["--version"],
-            false,
-            "可作为 YouTube 支持的外部 JavaScript runtime。",
-            None,
-            Some("手动安装：参考 https://deno.com/"),
-        ),
-        binary_check(
-            "bun",
-            "Bun",
-            &["--version"],
-            false,
-            "可作为 YouTube 支持的外部 JavaScript runtime。",
-            None,
-            Some("手动安装：brew tap oven-sh/bun && brew install oven-sh/bun/bun"),
-        ),
-        binary_check(
-            "qjs",
-            "QuickJS",
-            &["--version"],
-            false,
-            "轻量级 JavaScript runtime，可用于 yt-dlp-ejs。",
-            None,
-            None,
-        ),
-    ];
-
-    let node_ready = runtime_candidates
-        .iter()
-        .any(|item| item.id == "node" && item.status == "ready");
-    let stronger_runtime_ready = runtime_candidates
-        .iter()
-        .any(|item| matches!(item.id.as_str(), "deno" | "bun" | "qjs") && item.status == "ready");
-    let mut checks = vec![
-        yt_dlp,
-        ffmpeg,
-        ffprobe,
-        EnvironmentCheck {
-            id: "runtime".into(),
-            label: "JS Runtime".into(),
-            status: if stronger_runtime_ready {
-                "ready".into()
-            } else if node_ready {
-                "warning".into()
-            } else {
-                "warning".into()
-            },
-            version: runtime_candidates
-                .iter()
-                .find(|item| item.status == "ready")
-                .and_then(|item| item.version.clone()),
-            detail: if stronger_runtime_ready {
-                "已检测到 Deno / Bun / QuickJS，可优先用于 YouTube 登录态挑战求解。".into()
-            } else if node_ready {
-                "当前仅检测到 Node.js。普通解析可用，但 YouTube 登录态在部分链接上仍可能失败，建议补装 Deno 或 Bun。"
-                    .into()
-            } else {
-                "未检测到 Node.js / Deno / Bun / QuickJS。YouTube 部分能力可能不可用。".into()
-            },
-            required: false,
-            auto_install_available: false,
-            auto_install_label: None,
-            manual_install_hint: Some(
-                "建议优先安装 Deno 或 Bun；仅有 Node.js 时，YouTube 登录态解析可能不稳定。".into(),
-            ),
-        },
-    ];
-
-    checks.extend(runtime_candidates);
-
-    EnvironmentSnapshot {
-        checks,
-        recommended_output_dir: recommended_output_dir(),
-        note: if bundled_core_ready {
-            "已检测到应用内置下载内核。打包后的桌面版可直接使用，仅在特殊站点场景下可能需要额外运行时。".into()
-        } else if brew_available {
-            "已检测到 Homebrew。缺失依赖可以直接在首次安装区自动安装。".into()
-        } else {
-            "未检测到 Homebrew。自动安装不可用，请按手动安装提示补齐依赖。".into()
-        },
-        installer_available: brew_available,
-        installer_name: if brew_available {
-            Some("Homebrew".into())
-        } else {
-            None
-        },
-    }
-}
-
 #[tauri::command]
 async fn parse_url(payload: ParseUrlRequest) -> Result<MediaPreview, String> {
     let language = payload.language.clone();
@@ -1029,15 +384,13 @@ fn execute_parse_request(
     let mut command = binary_command("yt-dlp");
     command.args(&args);
     command.arg(normalized_url);
-    let output = command
-        .output()
-        .map_err(|error| {
-            if is_english(&payload.language) {
-                format!("Failed to start yt-dlp: {error}")
-            } else {
-                format!("无法启动 yt-dlp：{error}")
-            }
-        })?;
+    let output = command.output().map_err(|error| {
+        if is_english(&payload.language) {
+            format!("Failed to start yt-dlp: {error}")
+        } else {
+            format!("无法启动 yt-dlp：{error}")
+        }
+    })?;
 
     if !output.status.success() {
         return Err(normalize_parse_error(
@@ -1048,14 +401,13 @@ fn execute_parse_request(
         ));
     }
 
-    let json = String::from_utf8(output.stdout)
-        .map_err(|error| {
-            if is_english(&payload.language) {
-                format!("yt-dlp returned invalid JSON: {error}")
-            } else {
-                format!("yt-dlp 返回了无效 JSON：{error}")
-            }
-        })?;
+    let json = String::from_utf8(output.stdout).map_err(|error| {
+        if is_english(&payload.language) {
+            format!("yt-dlp returned invalid JSON: {error}")
+        } else {
+            format!("yt-dlp 返回了无效 JSON：{error}")
+        }
+    })?;
 
     serde_json::from_str(&json).map_err(|error| {
         if is_english(&payload.language) {
@@ -1145,19 +497,21 @@ fn retry_download(
             .task_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        requests
-            .get(&task_id)
-            .cloned()
-            .ok_or_else(|| {
-                if is_english(&request_language_from_state(&state, &task_id)) {
-                    "No retryable task configuration was found".to_string()
-                } else {
-                    "未找到可重试的任务配置".to_string()
-                }
-            })?
+        requests.get(&task_id).cloned().ok_or_else(|| {
+            if is_english(&request_language_from_state(&state, &task_id)) {
+                "No retryable task configuration was found".to_string()
+            } else {
+                "未找到可重试的任务配置".to_string()
+            }
+        })?
     };
 
-    enqueue_download(app, &state, request)
+    let next_task = enqueue_download(app.clone(), &state, request)?;
+    remove_task_entries(&state, &task_id);
+    persist_state(&state);
+    emit_task_removed(&app, &task_id);
+
+    Ok(next_task)
 }
 
 #[tauri::command]
@@ -1172,18 +526,15 @@ fn cancel_download(state: State<AppState>, task_id: String) -> Result<DownloadTa
     }
 
     if let Some(pid) = take_task_pid(&state.task_pids, &task_id) {
-        let status = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .map_err(|error| {
-                if is_english(&language) {
-                    format!("Failed to cancel the task: {error}")
-                } else {
-                    format!("取消任务失败：{error}")
-                }
-            })?;
+        let terminated = terminate_process(pid).map_err(|error| {
+            if is_english(&language) {
+                format!("Failed to cancel the task: {error}")
+            } else {
+                format!("取消任务失败：{error}")
+            }
+        })?;
 
-        if !status.success() {
+        if !terminated {
             return Err(if is_english(&language) {
                 "Failed to cancel the task because the download process could not be terminated"
                     .into()
@@ -1210,7 +561,7 @@ fn cancel_download(state: State<AppState>, task_id: String) -> Result<DownloadTa
 
 #[tauri::command]
 fn clear_tasks(state: State<AppState>, scope: String) -> Result<Vec<DownloadTask>, String> {
-    let removable_ids = {
+    let removable_tasks = {
         let tasks = state
             .tasks
             .lock()
@@ -1224,13 +575,35 @@ fn clear_tasks(state: State<AppState>, scope: String) -> Result<Vec<DownloadTask
                 "all" => true,
                 _ => false,
             })
-            .map(|task| task.id.clone())
+            .cloned()
             .collect::<Vec<_>>()
     };
 
     if scope != "completed" && scope != "failed" && scope != "all" {
         return Err("未知的清理范围".into());
     }
+
+    for task in removable_tasks
+        .iter()
+        .filter(|task| matches!(task.status.as_str(), "queued" | "running"))
+    {
+        {
+            let mut cancelled = state
+                .cancelled_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cancelled.insert(task.id.clone());
+        }
+
+        if let Some(pid) = take_task_pid(&state.task_pids, &task.id) {
+            let _ = terminate_process(pid);
+        }
+    }
+
+    let removable_ids = removable_tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
 
     {
         let mut tasks = state
@@ -1284,14 +657,13 @@ fn enqueue_download(
     let url = normalize_url(&payload.url, &payload.language)?;
     let output_dir = normalize_output_dir(&payload.output_dir);
 
-    fs::create_dir_all(&output_dir)
-        .map_err(|error| {
-            if is_english(&payload.language) {
-                format!("Failed to create output directory `{output_dir}`: {error}")
-            } else {
-                format!("无法创建下载目录 `{output_dir}`：{error}")
-            }
-        })?;
+    fs::create_dir_all(&output_dir).map_err(|error| {
+        if is_english(&payload.language) {
+            format!("Failed to create output directory `{output_dir}`: {error}")
+        } else {
+            format!("无法创建下载目录 `{output_dir}`：{error}")
+        }
+    })?;
 
     let generated_task_id = task_id();
 
@@ -1336,13 +708,37 @@ fn enqueue_download(
     let task_store = state.tasks.clone();
     let task_pids = state.task_pids.clone();
     let cancelled_tasks = state.cancelled_tasks.clone();
+    let download_gate = state.download_gate.clone();
     let thread_url = url.clone();
     let thread_task_id = generated_task_id.clone();
     thread::spawn(move || {
         let mut current_task = task;
+        let _permit = acquire_download_permit(&download_gate);
+
+        if get_task(&task_store, &thread_task_id).is_none() {
+            remove_task_runtime_entries(&app_state, &thread_task_id);
+            return;
+        }
+
+        if take_task_cancelled(&cancelled_tasks, &thread_task_id) {
+            current_task.status = "cancelled".into();
+            current_task.error = None;
+            current_task.speed = "--".into();
+            current_task.eta = "--".into();
+            if upsert_task_if_present(&task_store, &current_task) {
+                emit_task_update(&app_handle, &current_task);
+                persist_state(&app_state);
+            }
+            return;
+        }
+
         current_task.status = "running".into();
-        upsert_task(&task_store, &current_task);
-        emit_task_update(&app_handle, &current_task);
+        if upsert_task_if_present(&task_store, &current_task) {
+            emit_task_update(&app_handle, &current_task);
+        } else {
+            remove_task_runtime_entries(&app_state, &thread_task_id);
+            return;
+        }
 
         let first_attempt = run_download_attempt(
             &app_handle,
@@ -1351,12 +747,16 @@ fn enqueue_download(
             &mut current_task,
             &thread_url,
             &thread_task_id,
+            &payload_language,
             primary_args,
         );
 
         let final_result = if should_retry_with_fallback(&first_attempt.error) {
             current_task.error = Some(message_primary_fallback(&payload_language));
-            upsert_task(&task_store, &current_task);
+            if !upsert_task_if_present(&task_store, &current_task) {
+                remove_task_runtime_entries(&app_state, &thread_task_id);
+                return;
+            }
             emit_task_update(&app_handle, &current_task);
 
             current_task.progress = 0.0;
@@ -1370,6 +770,7 @@ fn enqueue_download(
                 &mut current_task,
                 &thread_url,
                 &thread_task_id,
+                &payload_language,
                 fallback_args,
             )
         } else {
@@ -1385,7 +786,10 @@ fn enqueue_download(
             current_task.progress = 0.0;
             current_task.speed = "--".into();
             current_task.eta = "--".into();
-            upsert_task(&task_store, &current_task);
+            if !upsert_task_if_present(&task_store, &current_task) {
+                remove_task_runtime_entries(&app_state, &thread_task_id);
+                return;
+            }
             emit_task_update(&app_handle, &current_task);
 
             let retried = run_download_attempt(
@@ -1395,6 +799,7 @@ fn enqueue_download(
                 &mut current_task,
                 &thread_url,
                 &thread_task_id,
+                &payload_language,
                 no_auth_primary_args,
             );
 
@@ -1403,7 +808,10 @@ fn enqueue_download(
                 current_task.progress = 0.0;
                 current_task.speed = "--".into();
                 current_task.eta = "--".into();
-                upsert_task(&task_store, &current_task);
+                if !upsert_task_if_present(&task_store, &current_task) {
+                    remove_task_runtime_entries(&app_state, &thread_task_id);
+                    return;
+                }
                 emit_task_update(&app_handle, &current_task);
 
                 run_download_attempt(
@@ -1413,6 +821,7 @@ fn enqueue_download(
                     &mut current_task,
                     &thread_url,
                     &thread_task_id,
+                    &payload_language,
                     no_auth_fallback_args,
                 )
             } else {
@@ -1424,32 +833,40 @@ fn enqueue_download(
 
         let was_cancelled = take_task_cancelled(&cancelled_tasks, &thread_task_id);
 
+        if get_task(&task_store, &thread_task_id).is_none() {
+            remove_task_runtime_entries(&app_state, &thread_task_id);
+            return;
+        }
+
         if was_cancelled {
             current_task.status = "cancelled".into();
             current_task.error = None;
             current_task.speed = "--".into();
             current_task.eta = "--".into();
-            upsert_task(&task_store, &current_task);
-            emit_task_update(&app_handle, &current_task);
-            persist_state(&app_state);
+            if upsert_task_if_present(&task_store, &current_task) {
+                emit_task_update(&app_handle, &current_task);
+                persist_state(&app_state);
+            }
         } else if final_result.success {
             current_task.status = "done".into();
             current_task.progress = 100.0;
             current_task.speed = "--".into();
             current_task.eta = "00:00".into();
             current_task.error = None;
-            upsert_task(&task_store, &current_task);
-            emit_task_update(&app_handle, &current_task);
-            record_history(&app_state, &app_handle, &current_task);
-            persist_state(&app_state);
+            if upsert_task_if_present(&task_store, &current_task) {
+                emit_task_update(&app_handle, &current_task);
+                record_history(&app_state, &app_handle, &current_task);
+                persist_state(&app_state);
+            }
         } else {
             current_task.status = "failed".into();
             if current_task.error.is_none() {
                 current_task.error = final_result.error;
             }
-            upsert_task(&task_store, &current_task);
-            emit_task_update(&app_handle, &current_task);
-            persist_state(&app_state);
+            if upsert_task_if_present(&task_store, &current_task) {
+                emit_task_update(&app_handle, &current_task);
+                persist_state(&app_state);
+            }
         }
     });
 
@@ -1476,60 +893,6 @@ fn enqueue_download(
             error: None,
         }),
     )
-}
-
-fn binary_check(
-    id: &str,
-    label: &str,
-    args: &[&str],
-    required: bool,
-    detail: &str,
-    auto_install_formula: Option<&str>,
-    manual_install_hint: Option<&str>,
-) -> EnvironmentCheck {
-    let bundled = resolve_binary_path(id);
-    match binary_output(id, args) {
-        Ok(output) if output.status.success() => {
-            let version = first_non_empty_line(&output.stdout)
-                .or_else(|| first_non_empty_line(&output.stderr))
-                .map(|value| {
-                    if bundled.is_some() {
-                        format!("{value}（内置）")
-                    } else {
-                        value
-                    }
-                });
-
-            EnvironmentCheck {
-                id: id.into(),
-                label: label.into(),
-                status: "ready".into(),
-                version,
-                detail: detail.into(),
-                required,
-                auto_install_available: false,
-                auto_install_label: auto_install_formula
-                    .map(|formula| format!("brew install {formula}")),
-                manual_install_hint: manual_install_hint.map(str::to_string),
-            }
-        }
-        Ok(_) | Err(_) => EnvironmentCheck {
-            id: id.into(),
-            label: label.into(),
-            status: if required {
-                "missing".into()
-            } else {
-                "warning".into()
-            },
-            version: None,
-            detail: detail.into(),
-            required,
-            auto_install_available: auto_install_formula.is_some(),
-            auto_install_label: auto_install_formula
-                .map(|formula| format!("brew install {formula}")),
-            manual_install_hint: manual_install_hint.map(str::to_string),
-        },
-    }
 }
 
 fn build_preview(root: &Value, source_url: String, language: &str) -> MediaPreview {
@@ -1607,7 +970,13 @@ fn collect_formats(root: &Value, language: &str) -> Vec<PreviewFormat> {
                                 .and_then(Value::as_str)
                                 .map(str::to_string)
                         })
-                        .unwrap_or_else(|| "原始格式".into());
+                        .unwrap_or_else(|| {
+                            if is_english(language) {
+                                "Original".into()
+                            } else {
+                                "原始格式".into()
+                            }
+                        });
                     let vcodec = item
                         .get("vcodec")
                         .and_then(Value::as_str)
@@ -1634,7 +1003,10 @@ fn collect_formats(root: &Value, language: &str) -> Vec<PreviewFormat> {
                         }
                         "video" => {
                             if is_english(language) {
-                                format!("Video Only / {} / Auto-pair best audio", ext.to_uppercase())
+                                format!(
+                                    "Video Only / {} / Auto-pair best audio",
+                                    ext.to_uppercase()
+                                )
                             } else {
                                 format!("仅视频 / {} / 自动搭配最佳音频", ext.to_uppercase())
                             }
@@ -1664,6 +1036,7 @@ fn collect_formats(root: &Value, language: &str) -> Vec<PreviewFormat> {
                             item.get("filesize")
                                 .and_then(Value::as_u64)
                                 .or_else(|| item.get("filesize_approx").and_then(Value::as_u64)),
+                            language,
                         ),
                         kind: kind.into(),
                     })
@@ -2000,6 +1373,7 @@ fn run_download_attempt(
     task: &mut DownloadTask,
     url: &str,
     task_id: &str,
+    language: &str,
     args: Vec<String>,
 ) -> DownloadAttemptResult {
     let mut command = binary_command("yt-dlp");
@@ -2013,7 +1387,11 @@ fn run_download_attempt(
         Err(error) => {
             return DownloadAttemptResult {
                 success: false,
-                error: Some(format!("无法启动下载任务：{error}")),
+                error: Some(if is_english(language) {
+                    format!("Failed to start the download task: {error}")
+                } else {
+                    format!("无法启动下载任务：{error}")
+                }),
             };
         }
     };
@@ -2053,15 +1431,23 @@ fn run_download_attempt(
         Ok(status) => DownloadAttemptResult {
             success: false,
             error: task.error.clone().or_else(|| {
-                Some(format!(
-                    "yt-dlp 退出码异常：{}",
-                    status.code().unwrap_or(-1)
-                ))
+                Some(if is_english(language) {
+                    format!(
+                        "yt-dlp exited with an unexpected status code: {}",
+                        status.code().unwrap_or(-1)
+                    )
+                } else {
+                    format!("yt-dlp 退出码异常：{}", status.code().unwrap_or(-1))
+                })
             }),
         },
         Err(error) => DownloadAttemptResult {
             success: false,
-            error: Some(format!("等待下载进程结束失败：{error}")),
+            error: Some(if is_english(language) {
+                format!("Failed to wait for the download process: {error}")
+            } else {
+                format!("等待下载进程结束失败：{error}")
+            }),
         },
     }
 }
@@ -2110,8 +1496,9 @@ fn process_download_output_line(
         if let Some(title) = title_from_output_path(&current.output) {
             current.title = title;
         }
-        upsert_task(store, &current);
-        emit_task_update(app, &current);
+        if upsert_task_if_present(store, &current) {
+            emit_task_update(app, &current);
+        }
         return;
     }
 
@@ -2119,8 +1506,9 @@ fn process_download_output_line(
         current.progress = progress.progress;
         current.speed = progress.speed;
         current.eta = progress.eta;
-        upsert_task(store, &current);
-        emit_task_update(app, &current);
+        if upsert_task_if_present(store, &current) {
+            emit_task_update(app, &current);
+        }
         return;
     }
 
@@ -2133,8 +1521,9 @@ fn process_download_output_line(
                 .trim()
                 .to_string(),
         );
-        upsert_task(store, &current);
-        emit_task_update(app, &current);
+        if upsert_task_if_present(store, &current) {
+            emit_task_update(app, &current);
+        }
     }
 }
 
@@ -2218,7 +1607,7 @@ fn duration_label(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "--:--".into())
 }
 
-fn byte_label(value: Option<u64>) -> String {
+fn byte_label(value: Option<u64>, language: &str) -> String {
     value
         .map(|bytes| {
             const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -2232,7 +1621,13 @@ fn byte_label(value: Option<u64>) -> String {
 
             format!("{size:.1} {}", UNITS[unit_index])
         })
-        .unwrap_or_else(|| "大小未知".into())
+        .unwrap_or_else(|| {
+            if is_english(language) {
+                "Unknown size".into()
+            } else {
+                "大小未知".into()
+            }
+        })
 }
 
 fn format_date(raw: &str) -> String {
@@ -2268,7 +1663,8 @@ fn normalize_parse_error(error: String, auth_mode: &str, url: &str, language: &s
         return if is_english(language) {
             "This link requires a signed-in session or browser cookies. Switch to Browser Cookies or import a cookie file and try again.".into()
         } else {
-            "当前链接需要登录态或浏览器 Cookie。请切换到“从浏览器读取”或导入 Cookie 文件后重试。".into()
+            "当前链接需要登录态或浏览器 Cookie。请切换到“从浏览器读取”或导入 Cookie 文件后重试。"
+                .into()
         };
     }
 
@@ -2406,6 +1802,24 @@ fn apply_remote_component_args(args: &mut Vec<String>, url: &str) {
         args.push("--remote-components".into());
         args.push("ejs:github".into());
     }
+}
+
+fn terminate_process(pid: u32) -> std::io::Result<bool> {
+    terminate_process_command(pid).map(|status| status.success())
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_process_command(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminate_process_command(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
 }
 
 fn preferred_js_runtime() -> Option<&'static str> {
@@ -2721,6 +2135,13 @@ fn expand_home_path(path: &str) -> String {
 }
 
 fn recommended_output_dir() -> String {
+    if let Some(download_dir) = dirs::download_dir() {
+        return download_dir
+            .join("拾流下载器")
+            .to_string_lossy()
+            .to_string();
+    }
+
     match env::var("HOME") {
         Ok(home) => format!("{home}/Downloads/拾流下载器"),
         Err(_) => "./Downloads/拾流下载器".into(),
@@ -2728,12 +2149,13 @@ fn recommended_output_dir() -> String {
 }
 
 fn task_id() -> String {
-    let now = SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
+    let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
 
-    format!("task-{now}")
+    format!("task-{millis:013}-{seq:06}")
 }
 
 fn infer_title_from_url(url: &str, language: &str) -> String {
@@ -2786,7 +2208,8 @@ fn message_retry_without_auth(language: &str) -> String {
 
 fn message_no_auth_fallback(language: &str) -> String {
     if is_english(language) {
-        "The preferred no-cookie format is unavailable. Retrying with a compatible fallback format.".into()
+        "The preferred no-cookie format is unavailable. Retrying with a compatible fallback format."
+            .into()
     } else {
         "无 Cookie 首选格式不可用，正在自动回退到兼容格式重新尝试。".into()
     }
@@ -2838,11 +2261,51 @@ fn take_task_cancelled(store: &Arc<Mutex<HashSet<String>>>, id: &str) -> bool {
     cancelled.remove(id)
 }
 
+fn acquire_download_permit(gate: &Arc<(Mutex<usize>, Condvar)>) -> DownloadPermit {
+    let (lock, cvar) = &**gate;
+    let mut available = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    while *available == 0 {
+        available = cvar
+            .wait(available)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
+    *available -= 1;
+
+    DownloadPermit {
+        gate: Arc::clone(gate),
+    }
+}
+
+fn release_download_permit(gate: &Arc<(Mutex<usize>, Condvar)>) {
+    let (lock, cvar) = &**gate;
+    let mut available = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *available += 1;
+    cvar.notify_one();
+}
+
 fn upsert_task(store: &Arc<Mutex<HashMap<String, DownloadTask>>>, task: &DownloadTask) {
     store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(task.id.clone(), task.clone());
+}
+
+fn upsert_task_if_present(
+    store: &Arc<Mutex<HashMap<String, DownloadTask>>>,
+    task: &DownloadTask,
+) -> bool {
+    let mut tasks = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if !tasks.contains_key(&task.id) {
+        return false;
+    }
+
+    tasks.insert(task.id.clone(), task.clone());
+    true
 }
 
 fn get_task(store: &Arc<Mutex<HashMap<String, DownloadTask>>>, id: &str) -> Option<DownloadTask> {
@@ -2853,8 +2316,35 @@ fn get_task(store: &Arc<Mutex<HashMap<String, DownloadTask>>>, id: &str) -> Opti
         .cloned()
 }
 
+fn remove_task_runtime_entries(state: &AppState, task_id: &str) {
+    remove_task_pid(&state.task_pids, task_id);
+    state
+        .task_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(task_id);
+    state
+        .cancelled_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(task_id);
+}
+
+fn remove_task_entries(state: &AppState, task_id: &str) {
+    state
+        .tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(task_id);
+    remove_task_runtime_entries(state, task_id);
+}
+
 fn emit_task_update(app: &AppHandle, task: &DownloadTask) {
     let _ = app.emit("download-task-updated", task);
+}
+
+fn emit_task_removed(app: &AppHandle, task_id: &str) {
+    let _ = app.emit("download-task-removed", task_id);
 }
 
 fn emit_history_update(app: &AppHandle, item: &HistoryItem) {
@@ -2913,9 +2403,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            detect_environment,
-            install_dependency,
-            install_missing_dependencies,
             parse_url,
             get_tasks,
             get_history,
@@ -2928,4 +2415,116 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_download_progress_lines() {
+        let progress =
+            parse_progress("[download]  42.0% of 10.00MiB at 1.50MiB/s ETA 00:05").unwrap();
+
+        assert_eq!(progress.progress, 42.0);
+        assert_eq!(progress.speed, "1.50MiB/s");
+        assert_eq!(progress.eta, "00:05");
+        assert!(parse_progress("[download] Destination: /tmp/file.mp4").is_none());
+        assert!(parse_progress("not a progress line").is_none());
+    }
+
+    #[test]
+    fn formats_byte_labels_with_localized_unknown() {
+        assert_eq!(byte_label(Some(1536), "zh-CN"), "1.5 KB");
+        assert_eq!(byte_label(None, "zh-CN"), "大小未知");
+        assert_eq!(byte_label(None, "en-US"), "Unknown size");
+    }
+
+    #[test]
+    fn formats_dates_when_compact_upload_date() {
+        assert_eq!(format_date("20240115"), "2024-01-15");
+        assert_eq!(format_date("2024-01-15"), "2024-01-15");
+        assert_eq!(format_date("202401"), "202401");
+    }
+
+    #[test]
+    fn extracts_titles_from_output_paths() {
+        assert_eq!(
+            title_from_output_path("/x/My Video [abc123].mp4").as_deref(),
+            Some("My Video")
+        );
+        assert_eq!(
+            title_from_output_path("/x/No Bracket.mp3").as_deref(),
+            Some("No Bracket")
+        );
+    }
+
+    #[test]
+    fn formats_duration_labels() {
+        let short = json!(65);
+        let long = json!(3661.4);
+
+        assert_eq!(duration_label(Some(&short)), "01:05");
+        assert_eq!(duration_label(Some(&long)), "01:01:01");
+        assert_eq!(duration_label(None), "--:--");
+    }
+
+    #[test]
+    fn detects_youtube_urls() {
+        assert!(is_youtube_url("https://www.youtube.com/watch?v=abc"));
+        assert!(is_youtube_url("https://youtu.be/abc"));
+        assert!(!is_youtube_url("https://example.com/watch?v=abc"));
+    }
+
+    #[test]
+    fn extracts_output_paths_from_known_prefixes() {
+        assert_eq!(
+            extract_output_path("[download] Destination: /tmp/video.mp4").as_deref(),
+            Some("/tmp/video.mp4")
+        );
+        assert_eq!(
+            extract_output_path("[ExtractAudio] Destination: /tmp/audio.mp3").as_deref(),
+            Some("/tmp/audio.mp3")
+        );
+        assert_eq!(
+            extract_output_path("[Merger] Merging formats into \"/tmp/merged.mp4\"").as_deref(),
+            Some("/tmp/merged.mp4")
+        );
+    }
+
+    #[test]
+    fn detects_format_fallback_errors() {
+        assert!(should_retry_with_fallback(&Some(
+            "Requested format is not available".into()
+        )));
+        assert!(should_retry_with_fallback(&Some(
+            "requested format not available".into()
+        )));
+        assert!(!should_retry_with_fallback(&Some("network error".into())));
+        assert!(!should_retry_with_fallback(&None));
+    }
+
+    #[test]
+    fn sanitizes_settings_and_language() {
+        let sanitized = sanitize_settings(AppSettings {
+            output_dir: "/tmp/downloads".into(),
+            default_download_mode: "bad-mode".into(),
+            default_playlist_scope: "bad-scope".into(),
+            default_auth_mode: "bad-auth".into(),
+            default_browser: "bad-browser".into(),
+            default_cookie_file: "  /tmp/cookies.txt  ".into(),
+            language: "english".into(),
+        });
+
+        assert_eq!(sanitized.output_dir, "/tmp/downloads");
+        assert_eq!(sanitized.default_download_mode, "video");
+        assert_eq!(sanitized.default_playlist_scope, "video");
+        assert_eq!(sanitized.default_auth_mode, "none");
+        assert_eq!(sanitized.default_browser, "chrome");
+        assert_eq!(sanitized.default_cookie_file, "/tmp/cookies.txt");
+        assert_eq!(sanitized.language, "en-US");
+        assert_eq!(sanitize_language("zh-CN"), "zh-CN");
+        assert_eq!(sanitize_language("en"), "en-US");
+    }
 }

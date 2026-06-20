@@ -117,6 +117,7 @@ const messages = {
       noPlaylistEntries: "当前解析结果不是播放列表，或站点没有返回条目预览。",
       loadingEntryFormats: "正在加载该条目的可下载格式...",
       entryFormatsHint: "点击某一条视频后，可以为这条单独指定格式；未指定的条目会按默认规则下载。",
+      playlistAutoFormatNote: "整列表下载将自动选择每条视频的最佳格式；下方格式仅供查看。",
       emptyTitle: "还没有解析结果。",
       emptyHint: "先解析链接，右侧会撑满展示所有可下载格式，再从中选择下载。",
       itemCount: (count: number) => `${count} 项`,
@@ -279,6 +280,7 @@ const messages = {
       noPlaylistEntries: "This result is not a playlist, or the site did not return entry previews.",
       loadingEntryFormats: "Loading formats for this entry...",
       entryFormatsHint: "Click an item to override its format. Unselected entries will use the default rule.",
+      playlistAutoFormatNote: "Full-playlist download auto-selects the best format per video; entry formats below are informational.",
       emptyTitle: "No preview yet.",
       emptyHint: "Parse a link first. All available formats will appear here for selection.",
       itemCount: (count: number) => `${count} items`,
@@ -385,4 +387,3 @@ export function browserOptionsFor(language: AppLanguage) {
 export function statusLabelFor(language: AppLanguage, status: TaskStatus) {
   return copyFor(language).statusLabels[status];
 }
-

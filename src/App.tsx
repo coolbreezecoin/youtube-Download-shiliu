@@ -127,6 +127,7 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     let cleanupTaskEvents: (() => void) | undefined;
+    let cleanupTaskRemovedEvents: (() => void) | undefined;
     let cleanupHistoryEvents: (() => void) | undefined;
 
     async function bindTaskEvents() {
@@ -136,6 +137,14 @@ function App() {
         }
 
         setTasks((current) => upsertTask(current, event.payload));
+      });
+
+      cleanupTaskRemovedEvents = await listen<string>("download-task-removed", (event) => {
+        if (cancelled) {
+          return;
+        }
+
+        setTasks((current) => current.filter((task) => task.id !== event.payload));
       });
 
       cleanupHistoryEvents = await listen<HistoryItem>("history-item-added", (event) => {
@@ -162,6 +171,7 @@ function App() {
     return () => {
       cancelled = true;
       cleanupTaskEvents?.();
+      cleanupTaskRemovedEvents?.();
       cleanupHistoryEvents?.();
     };
   }, []);
@@ -244,6 +254,10 @@ function App() {
   }, [preview]);
 
   useEffect(() => {
+    if (playlistScope === "playlist") {
+      return;
+    }
+
     if (!selectedPlaylistEntry || visibleSelectedPlaylistEntryFormats.length === 0) {
       return;
     }
@@ -261,6 +275,7 @@ function App() {
     }
   }, [
     playlistEntrySelections,
+    playlistScope,
     selectedPlaylistEntry,
     visibleSelectedPlaylistEntryFormats,
   ]);
@@ -361,7 +376,6 @@ function App() {
       normalizedUrls,
       preview,
       defaultSelector,
-      playlistEntrySelections,
       downloadMode,
       playlistScope,
     });
@@ -852,6 +866,29 @@ function App() {
                         ) : null}
                         {isLoadingPlaylistEntry ? (
                           <div className="empty-state">{copy.preview.loadingEntryFormats}</div>
+                        ) : playlistScope === "playlist" ? (
+                          <>
+                            <div className="empty-state">{copy.preview.playlistAutoFormatNote}</div>
+                            {selectedPlaylistEntry && visibleSelectedPlaylistEntryFormats.length > 0 ? (
+                              <div className="list-stack format-grid">
+                                {visibleSelectedPlaylistEntryFormats.map((format) => (
+                                  <div
+                                    key={`${selectedPlaylistEntry.index}-${format.formatId}`}
+                                    className="list-card format-card"
+                                  >
+                                    <div>
+                                      <strong>{format.label}</strong>
+                                      <p>{format.detail}</p>
+                                    </div>
+                                    <div className="format-side">
+                                      <span>{format.size}</span>
+                                      <small>{format.kind}</small>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : null}
+                          </>
                         ) : selectedPlaylistEntry && visibleSelectedPlaylistEntryFormats.length > 0 ? (
                           <div className="list-stack format-grid">
                             {visibleSelectedPlaylistEntryFormats.map((format) => (
@@ -1351,29 +1388,24 @@ function buildBatchTargets({
   normalizedUrls,
   preview,
   defaultSelector,
-  playlistEntrySelections,
   downloadMode,
   playlistScope,
 }: {
   normalizedUrls: string[];
   preview: MediaPreview | null;
   defaultSelector: string | null;
-  playlistEntrySelections: Record<number, string>;
   downloadMode: DownloadMode;
   playlistScope: PlaylistScope;
 }) {
-  if (preview?.isPlaylist && playlistScope === "playlist" && preview.playlistEntries.length > 0) {
-    return preview.playlistEntries
-      .filter((entry) => entry.sourceUrl)
-      .map((entry) => ({
-        url: entry.sourceUrl,
-        title: entry.title,
-        formatId:
-          downloadMode === "subtitles"
-            ? null
-            : playlistEntrySelections[entry.index] || defaultSelector,
-        playlistScope: "video" as PlaylistScope,
-      }));
+  if (preview?.isPlaylist && playlistScope === "playlist") {
+    return [
+      {
+        url: preview.sourceUrl,
+        title: preview.title,
+        formatId: null,
+        playlistScope: "playlist" as PlaylistScope,
+      },
+    ];
   }
 
   return normalizedUrls.map((url, index) => ({

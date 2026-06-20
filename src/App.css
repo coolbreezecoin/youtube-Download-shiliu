@@ -205,37 +205,6 @@ button {
   justify-content: flex-end;
 }
 
-.install-progress-card {
-  margin-top: 8px;
-  padding: 10px 12px;
-  border-radius: 16px;
-  border: 1px solid rgba(243, 238, 223, 0.08);
-  background: rgba(243, 238, 223, 0.04);
-}
-
-.install-progress-header,
-.install-progress-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.install-progress-header span,
-.install-progress-meta span {
-  color: rgba(243, 238, 223, 0.72);
-  font-size: 0.84rem;
-}
-
-.install-progress-meta {
-  margin-top: 8px;
-}
-
-.install-progress-meta strong {
-  color: #f7f1e2;
-  font-size: 0.84rem;
-}
-
 .top-nav {
   display: flex;
   gap: 12px;

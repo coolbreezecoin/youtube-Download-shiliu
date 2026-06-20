@@ -14,6 +14,8 @@ dist-ssr
 release-artifacts
 src-tauri/binaries/*x86_64-apple-darwin
 src-tauri/binaries/*x86_64-pc-windows-msvc.exe
+src-tauri/binaries/deno-aarch64-apple-darwin
+src-tauri/binaries/yt-dlp-aarch64-apple-darwin
 src-tauri/resources/ffmpeg-libs-x86_64-apple-darwin/*
 !src-tauri/resources/ffmpeg-libs-x86_64-apple-darwin/.gitkeep
 src-tauri/resources/python-runtime-aarch64-apple-darwin/*

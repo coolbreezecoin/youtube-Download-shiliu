@@ -49,8 +49,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Fetch Intel Mac sidecars
-        if: matrix.target == 'x86_64-apple-darwin'
+      - name: Fetch macOS sidecars
         run: bash scripts/fetch-platform-assets.sh "$TARGET_TRIPLE"
 
       - name: Validate platform assets

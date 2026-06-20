@@ -111,6 +111,7 @@ prepare_macos_x64() {
 
 prepare_macos_arm64() {
   local yt_dlp_path="$ROOT_DIR/src-tauri/binaries/yt-dlp-aarch64-apple-darwin"
+  local deno_path="$ROOT_DIR/src-tauri/binaries/deno-aarch64-apple-darwin"
   local python_dir="$ROOT_DIR/src-tauri/resources/python-runtime-aarch64-apple-darwin"
 
   ensure_parent "$yt_dlp_path"
@@ -118,6 +119,13 @@ prepare_macos_arm64() {
   echo "Fetching yt-dlp script for Apple Silicon Mac..."
   download "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" "$yt_dlp_path"
   chmod +x "$yt_dlp_path"
+
+  if ! have_file "$deno_path"; then
+    echo "Fetching Deno for Apple Silicon Mac..."
+    download "https://dl.deno.land/release/$DENO_VERSION/deno-aarch64-apple-darwin.zip" "$TMP_DIR/deno-macos-arm64.zip"
+    extract_zip_entry "$TMP_DIR/deno-macos-arm64.zip" "deno" "$deno_path"
+    chmod +x "$deno_path"
+  fi
 
   if [[ ! -x "$python_dir/python/bin/python3" ]]; then
     echo "Fetching Python runtime for Apple Silicon Mac..."

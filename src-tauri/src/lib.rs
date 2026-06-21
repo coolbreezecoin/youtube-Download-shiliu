@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 3;
@@ -221,15 +221,25 @@ fn default_settings() -> AppSettings {
 }
 
 fn persistence_path() -> PathBuf {
+    app_config_dir().join("ytDownloader").join("state.json")
+}
+
+fn app_config_dir() -> PathBuf {
     if let Some(config_dir) = dirs::config_dir() {
-        return config_dir.join("ytDownloader").join("state.json");
+        return config_dir;
     }
 
     let home = env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".config")
-        .join("ytDownloader")
-        .join("state.json")
+    PathBuf::from(home).join(".config")
+}
+
+fn yt_dlp_override_path() -> Option<PathBuf> {
+    Some(
+        app_config_dir()
+            .join("ytDownloader")
+            .join("bin")
+            .join(bundled_binary_name("yt-dlp")),
+    )
 }
 
 fn persist_state(state: &AppState) {
@@ -649,6 +659,79 @@ fn clear_tasks(state: State<AppState>, scope: String) -> Result<Vec<DownloadTask
     Ok(get_tasks(state))
 }
 
+#[tauri::command]
+fn update_yt_dlp(force: bool) -> Result<String, String> {
+    let target = yt_dlp_override_path().ok_or_else(|| {
+        "无法确定 yt-dlp 更新目录 / Could not resolve the yt-dlp update path".to_string()
+    })?;
+
+    if !force && is_recent_file(&target, Duration::from_secs(24 * 60 * 60)) {
+        return current_yt_dlp_version();
+    }
+
+    let parent = target.parent().ok_or_else(|| {
+        "无法确定 yt-dlp 更新目录 / Could not resolve the yt-dlp update directory".to_string()
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!("无法创建 yt-dlp 更新目录 / Failed to create yt-dlp update directory: {error}")
+    })?;
+
+    let tmp_path = target.with_file_name(format!(
+        "{}.download-{}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("yt-dlp"),
+        current_millis()
+    ));
+    let _ = fs::remove_file(&tmp_path);
+
+    let output = Command::new("curl")
+        .args(["-fL", "--retry", "3", "--retry-delay", "1", "-o"])
+        .arg(&tmp_path)
+        .arg(yt_dlp_download_url())
+        .output()
+        .map_err(|error| {
+            format!("无法启动 yt-dlp 更新下载 / Failed to start yt-dlp update download: {error}")
+        })?;
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "yt-dlp 更新下载失败 / Failed to download yt-dlp update: {}",
+            command_error(&output.stderr, &output.stdout)
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&tmp_path)
+            .map_err(|error| format!("无法读取 yt-dlp 更新文件权限 / Failed to read yt-dlp update permissions: {error}"))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmp_path, permissions).map_err(|error| {
+            format!(
+                "无法设置 yt-dlp 更新文件权限 / Failed to set yt-dlp update permissions: {error}"
+            )
+        })?;
+    }
+
+    let _ = fs::remove_file(&target);
+    fs::rename(&tmp_path, &target).map_err(|error| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("无法安装 yt-dlp 更新 / Failed to install yt-dlp update: {error}")
+    })?;
+
+    current_yt_dlp_version()
+}
+
+#[tauri::command]
+fn get_yt_dlp_version() -> Result<String, String> {
+    current_yt_dlp_version()
+}
+
 fn enqueue_download(
     app: AppHandle,
     state: &State<AppState>,
@@ -862,6 +945,12 @@ fn enqueue_download(
             current_task.status = "failed".into();
             if current_task.error.is_none() {
                 current_task.error = final_result.error;
+            }
+            if let Some(error) = current_task.error.as_deref() {
+                if let Some(hint) = cookie_error_hint(error, &original_auth_mode, &payload_language)
+                {
+                    current_task.error = Some(hint);
+                }
             }
             if upsert_task_if_present(&task_store, &current_task) {
                 emit_task_update(&app_handle, &current_task);
@@ -1659,6 +1748,10 @@ fn command_error(stderr: &[u8], stdout: &[u8]) -> String {
 }
 
 fn normalize_parse_error(error: String, auth_mode: &str, url: &str, language: &str) -> String {
+    if let Some(hint) = cookie_error_hint(&error, auth_mode, language) {
+        return hint;
+    }
+
     if error.contains("Sign in to confirm you’re not a bot") {
         return if is_english(language) {
             "This link requires a signed-in session or browser cookies. Switch to Browser Cookies or import a cookie file and try again.".into()
@@ -1689,6 +1782,38 @@ fn normalize_parse_error(error: String, auth_mode: &str, url: &str, language: &s
     }
 
     error
+}
+
+fn cookie_error_hint(error: &str, auth_mode: &str, language: &str) -> Option<String> {
+    if auth_mode == "none" {
+        return None;
+    }
+
+    let normalized = error.to_ascii_lowercase();
+    let is_cookie_error = normalized.contains("could not copy chrome cookie database")
+        || normalized.contains("failed to decrypt")
+        || normalized.contains("unable to open database file")
+        || normalized.contains("could not find chrome cookies database")
+        || normalized.contains("dpapi")
+        || (normalized.contains("permission denied") && normalized.contains("cookie"))
+        || (normalized.contains("no such file or directory") && normalized.contains("cookie"))
+        || (normalized.contains("does not exist") && normalized.contains("cookie"));
+
+    if !is_cookie_error {
+        return None;
+    }
+
+    Some(if auth_mode == "browser" {
+        if is_english(language) {
+            "Couldn't read cookies from your browser. Fully quit the browser and retry, or export a cookies.txt file and switch to 'Cookie File' mode (recommended on recent Chrome/macOS).".into()
+        } else {
+            "无法从浏览器读取 Cookie。请完全退出该浏览器后重试，或导出 cookies.txt 并改用“Cookie 文件”模式（新版 Chrome / macOS 更推荐这种方式）。".into()
+        }
+    } else if is_english(language) {
+        "The cookie file could not be read. Re-export a fresh cookies.txt (Netscape format) and check the path.".into()
+    } else {
+        "无法读取 Cookie 文件。请重新导出 cookies.txt（Netscape 格式）并检查路径。".into()
+    })
 }
 
 fn should_retry_without_auth(url: &str, auth_mode: &str, error: &str) -> bool {
@@ -1770,6 +1895,14 @@ fn apply_auth_args(
                         "认证模式为 Cookie 文件，但没有填写文件路径".to_string()
                     }
                 })?;
+
+            if !std::path::Path::new(&file_path).is_file() {
+                return Err(if is_english(language) {
+                    format!("Cookie file not found: {file_path}")
+                } else {
+                    format!("未找到 Cookie 文件：{file_path}")
+                });
+            }
 
             args.push("--cookies".into());
             args.push(file_path);
@@ -1882,10 +2015,43 @@ fn binary_output(binary: &str, args: &[impl AsRef<str>]) -> std::io::Result<Outp
     command.output()
 }
 
+fn current_yt_dlp_version() -> Result<String, String> {
+    let output = binary_output("yt-dlp", &["--version"]).map_err(|error| {
+        format!("无法读取 yt-dlp 版本 / Failed to read yt-dlp version: {error}")
+    })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "无法读取 yt-dlp 版本 / Failed to read yt-dlp version: {}",
+            command_error(&output.stderr, &output.stdout)
+        ));
+    }
+
+    first_non_empty_line(&output.stdout)
+        .ok_or_else(|| "yt-dlp 未返回版本号 / yt-dlp did not return a version".into())
+}
+
 fn resolve_binary_path(binary: &str) -> Option<PathBuf> {
     bundled_binary_candidates(binary)
         .into_iter()
         .find(|path| path.is_file())
+}
+
+fn yt_dlp_download_url() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe"
+    } else {
+        "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp"
+    }
+}
+
+fn is_recent_file(path: &Path, max_age: Duration) -> bool {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .map(|age| age < max_age)
+        .unwrap_or(false)
 }
 
 fn apply_binary_runtime_env(binary: &str, command: &mut Command) {
@@ -1903,6 +2069,12 @@ fn bundled_binary_candidates(binary: &str) -> Vec<PathBuf> {
     let bundled_name = bundled_binary_name(binary);
     let dev_name = dev_binary_name(binary);
     let mut candidates = Vec::new();
+
+    if binary == "yt-dlp" {
+        if let Some(path) = yt_dlp_override_path() {
+            candidates.push(path);
+        }
+    }
 
     if let Ok(current_exe) = env::current_exe() {
         if let Some(parent) = current_exe.parent() {
@@ -2149,13 +2321,17 @@ fn recommended_output_dir() -> String {
 }
 
 fn task_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
+    let millis = current_millis();
     let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
 
     format!("task-{millis:013}-{seq:06}")
+}
+
+fn current_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 fn infer_title_from_url(url: &str, language: &str) -> String {
@@ -2411,7 +2587,9 @@ pub fn run() {
             start_download,
             retry_download,
             cancel_download,
-            clear_tasks
+            clear_tasks,
+            get_yt_dlp_version,
+            update_yt_dlp
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2503,6 +2681,50 @@ mod tests {
         )));
         assert!(!should_retry_with_fallback(&Some("network error".into())));
         assert!(!should_retry_with_fallback(&None));
+    }
+
+    #[test]
+    fn normalizes_browser_cookie_errors_before_generic_youtube_errors() {
+        let message = normalize_parse_error(
+            "ERROR: Could not copy Chrome cookie database. Requested format is not available"
+                .into(),
+            "browser",
+            "https://www.youtube.com/watch?v=abc",
+            "en-US",
+        );
+
+        assert!(message.contains("Couldn't read cookies from your browser"));
+        assert!(!message.contains("challenge compatibility"));
+    }
+
+    #[test]
+    fn does_not_classify_video_unavailable_as_cookie_error() {
+        let raw_error = "ERROR: [youtube] abc: This video does not exist.";
+        let message = normalize_parse_error(
+            raw_error.into(),
+            "browser",
+            "https://www.youtube.com/watch?v=abc",
+            "en-US",
+        );
+
+        assert_eq!(message, raw_error);
+        assert!(!message.contains("Couldn't read cookies from your browser"));
+    }
+
+    #[test]
+    fn rejects_missing_cookie_file_before_running_yt_dlp() {
+        let mut args = Vec::new();
+        let error = apply_auth_args(
+            &mut args,
+            "file",
+            None,
+            Some("/definitely/not/a/cookies.txt"),
+            "en-US",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Cookie file not found"));
+        assert!(args.is_empty());
     }
 
     #[test]

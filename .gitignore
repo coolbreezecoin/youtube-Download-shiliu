@@ -21,6 +21,17 @@ src-tauri/resources/ffmpeg-libs-x86_64-apple-darwin/*
 src-tauri/resources/python-runtime-aarch64-apple-darwin/*
 src-tauri/resources/python-runtime-x86_64-apple-darwin/*
 
+# Secrets / key material — NEVER commit. Defense-in-depth: ignore the
+# migration package and any stray private keys that land in the repo dir.
+密钥迁移包*/
+*.p12
+*.p8
+*.pem
+*.certSigningRequest
+*.cer
+id_ed25519*
+**/hosts.yml
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

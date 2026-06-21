@@ -65,6 +65,9 @@ function App() {
   const [settingsError, setSettingsError] = useState("");
   const [settingsMessage, setSettingsMessage] = useState("");
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [ytDlpVersion, setYtDlpVersion] = useState("");
+  const [ytDlpUpdateError, setYtDlpUpdateError] = useState("");
+  const [isUpdatingYtDlp, setIsUpdatingYtDlp] = useState(false);
   const language = settings.language;
   const copy = copyFor(language);
   const modeOptions = modeOptionsFor(language);
@@ -121,6 +124,30 @@ function App() {
 
     return () => {
       mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void invoke<string>("get_yt_dlp_version")
+      .then((version) => {
+        if (!cancelled) {
+          setYtDlpVersion((current) => current || version);
+        }
+      })
+      .catch(() => {});
+
+    void invoke<string>("update_yt_dlp", { force: false })
+      .then((version) => {
+        if (!cancelled) {
+          setYtDlpVersion(version);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -198,6 +225,15 @@ function App() {
     selectedPlaylistEntryPreview?.formats ?? [],
     downloadMode,
   );
+  const isChromiumCookieBrowser = [
+    "chrome",
+    "chromium",
+    "edge",
+    "brave",
+    "vivaldi",
+    "opera",
+    "whale",
+  ].includes(browser);
   const settingsDirty = isSettingsDirty(settings, savedSettings);
 
   const statusCounts = tasks.reduce<Record<TaskStatus, number>>(
@@ -506,6 +542,20 @@ function App() {
     }
   }
 
+  async function handleUpdateYtDlp() {
+    setYtDlpUpdateError("");
+    setIsUpdatingYtDlp(true);
+
+    try {
+      const version = await invoke<string>("update_yt_dlp", { force: true });
+      setYtDlpVersion(version);
+    } catch (error) {
+      setYtDlpUpdateError(stringifyError(error));
+    } finally {
+      setIsUpdatingYtDlp(false);
+    }
+  }
+
   function handleResetSettings() {
     setSettings(savedSettings);
     setSettingsError("");
@@ -647,36 +697,54 @@ function App() {
                 ) : null}
 
                 {authMode === "browser" ? (
-                  <div className="auth-detail-row">
-                    <label className="field-label" htmlFor="cookie-browser">
-                      {copy.input.browser}
-                    </label>
-                    <select
-                      id="cookie-browser"
-                      value={browser}
-                      onChange={(event) => setBrowser(event.currentTarget.value as CookieBrowser)}
-                    >
-                      {browserOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                  <>
+                    <div className="auth-detail-row">
+                      <label className="field-label" htmlFor="cookie-browser">
+                        {copy.input.browser}
+                      </label>
+                      <select
+                        id="cookie-browser"
+                        value={browser}
+                        onChange={(event) => setBrowser(event.currentTarget.value as CookieBrowser)}
+                      >
+                        {browserOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <p className="helper-copy compact">
+                      {isChromiumCookieBrowser
+                        ? language === "en-US"
+                          ? "If cookie reading fails, fully quit the browser and retry. On recent Chrome/macOS, exporting a cookies.txt file and switching to Cookie File mode is usually more reliable."
+                          : "如果读取 Cookie 失败，请完全退出该浏览器后重试。新版 Chrome / macOS 上，导出 cookies.txt 并切换到 Cookie 文件模式通常更可靠。"
+                        : language === "en-US"
+                          ? "If cookie reading fails, fully quit the browser and retry, or export a cookies.txt file and switch to Cookie File mode."
+                          : "如果读取 Cookie 失败，请完全退出该浏览器后重试，或导出 cookies.txt 并切换到 Cookie 文件模式。"}
+                    </p>
+                  </>
                 ) : null}
 
                 {authMode === "file" ? (
-                  <div className="auth-detail-row">
-                    <label className="field-label" htmlFor="cookie-file">
-                      {copy.input.cookieFile}
-                    </label>
-                    <input
-                      id="cookie-file"
-                      value={cookieFile}
-                      onChange={(event) => setCookieFile(event.currentTarget.value)}
-                      placeholder={copy.input.cookiePlaceholder}
-                    />
-                  </div>
+                  <>
+                    <div className="auth-detail-row">
+                      <label className="field-label" htmlFor="cookie-file">
+                        {copy.input.cookieFile}
+                      </label>
+                      <input
+                        id="cookie-file"
+                        value={cookieFile}
+                        onChange={(event) => setCookieFile(event.currentTarget.value)}
+                        placeholder={copy.input.cookiePlaceholder}
+                      />
+                    </div>
+                    <p className="helper-copy compact">
+                      {language === "en-US"
+                        ? "Export a Netscape-format cookies.txt file with a local browser extension such as “Get cookies.txt LOCALLY”, then select that file here."
+                        : "可用本地浏览器扩展（如 “Get cookies.txt LOCALLY”）导出 Netscape 格式的 cookies.txt，然后在这里选择该文件。"}
+                    </p>
+                  </>
                 ) : null}
               </div>
 
@@ -1305,6 +1373,35 @@ function App() {
                   <span>{copy.settings.summaryAuth}</span>
                   <strong>{labelForAuthMode(settings.defaultAuthMode, language)}</strong>
                 </div>
+              </div>
+
+              <div className="settings-summary-card">
+                <div className="setting-row">
+                  <span>{language === "en-US" ? "Download core" : "下载内核"}</span>
+                  <strong>
+                    {ytDlpVersion ||
+                      (language === "en-US" ? "Checking in background" : "后台检查中")}
+                  </strong>
+                </div>
+                <div className="action-row settings-actions">
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    onClick={() => void handleUpdateYtDlp()}
+                    disabled={isUpdatingYtDlp}
+                  >
+                    {isUpdatingYtDlp
+                      ? language === "en-US"
+                        ? "Checking..."
+                        : "检查中..."
+                      : language === "en-US"
+                        ? "Check for updates"
+                        : "检查更新"}
+                  </button>
+                </div>
+                {ytDlpUpdateError ? (
+                  <p className="error-banner">{ytDlpUpdateError}</p>
+                ) : null}
               </div>
 
               {settingsError ? <p className="error-banner">{settingsError}</p> : null}

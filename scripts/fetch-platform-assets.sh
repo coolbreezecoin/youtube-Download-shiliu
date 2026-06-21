@@ -16,6 +16,7 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 DENO_VERSION="${DENO_VERSION:-$(curl -fsSL https://dl.deno.land/release-latest.txt)}"
 PYTHON_STANDALONE_RELEASE="${PYTHON_STANDALONE_RELEASE:-20260320}"
 PYTHON_STANDALONE_VERSION="${PYTHON_STANDALONE_VERSION:-3.12.13}"
+YT_DLP_RELEASE_BASE="${YT_DLP_RELEASE_BASE:-https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download}"
 
 if [[ -z "$PYTHON_BIN" ]]; then
   echo "Python is required to extract release archives." >&2
@@ -74,7 +75,7 @@ prepare_macos_x64() {
   ensure_parent "$yt_dlp_path"
 
   echo "Fetching yt-dlp script for Intel Mac..."
-  download "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" "$yt_dlp_path"
+  download "$YT_DLP_RELEASE_BASE/yt-dlp" "$yt_dlp_path"
   chmod +x "$yt_dlp_path"
 
   if ! have_file "$ffmpeg_path"; then
@@ -117,7 +118,7 @@ prepare_macos_arm64() {
   ensure_parent "$yt_dlp_path"
 
   echo "Fetching yt-dlp script for Apple Silicon Mac..."
-  download "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" "$yt_dlp_path"
+  download "$YT_DLP_RELEASE_BASE/yt-dlp" "$yt_dlp_path"
   chmod +x "$yt_dlp_path"
 
   if ! have_file "$deno_path"; then
@@ -148,7 +149,7 @@ prepare_windows_x64() {
 
   if ! have_file "$yt_dlp_path"; then
     echo "Fetching yt-dlp for Windows..."
-    download "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" "$yt_dlp_path"
+    download "$YT_DLP_RELEASE_BASE/yt-dlp.exe" "$yt_dlp_path"
   fi
 
   if ! have_file "$ffmpeg_path" || ! have_file "$ffprobe_path"; then

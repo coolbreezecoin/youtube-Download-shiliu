@@ -97,7 +97,7 @@ jobs:
             echo "Notarized app not found in release-artifacts" >&2
             exit 1
           fi
-          ditto -c -k --keepParent "$APP_PATH" "${APP_PATH}.zip"
+          ditto -c -k --keepParent "$APP_PATH" "release-artifacts/shiliu-${{ matrix.artifact_suffix }}.app.zip"
 
       - name: Upload build artifacts
         if: steps.validate_assets.outcome == 'success'

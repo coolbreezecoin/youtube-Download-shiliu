@@ -65,12 +65,21 @@ have_file() {
   [[ -s "$path" ]]
 }
 
+ensure_placeholder_dir() {
+  local path="$1"
+  if [[ ! -d "$path" ]]; then
+    mkdir -p "$path"
+    touch "$path/.gitkeep"
+  fi
+}
+
 prepare_macos_x64() {
   local yt_dlp_path="$ROOT_DIR/src-tauri/binaries/yt-dlp-x86_64-apple-darwin"
   local ffmpeg_path="$ROOT_DIR/src-tauri/binaries/ffmpeg-x86_64-apple-darwin"
   local ffprobe_path="$ROOT_DIR/src-tauri/binaries/ffprobe-x86_64-apple-darwin"
   local deno_path="$ROOT_DIR/src-tauri/binaries/deno-x86_64-apple-darwin"
   local python_dir="$ROOT_DIR/src-tauri/resources/python-runtime-x86_64-apple-darwin"
+  local other_python_dir="$ROOT_DIR/src-tauri/resources/python-runtime-aarch64-apple-darwin"
 
   ensure_parent "$yt_dlp_path"
 
@@ -108,12 +117,15 @@ prepare_macos_x64() {
       "$TMP_DIR/python-macos-x64.tar.gz"
     tar -xzf "$TMP_DIR/python-macos-x64.tar.gz" -C "$python_dir"
   fi
+
+  ensure_placeholder_dir "$other_python_dir"
 }
 
 prepare_macos_arm64() {
   local yt_dlp_path="$ROOT_DIR/src-tauri/binaries/yt-dlp-aarch64-apple-darwin"
   local deno_path="$ROOT_DIR/src-tauri/binaries/deno-aarch64-apple-darwin"
   local python_dir="$ROOT_DIR/src-tauri/resources/python-runtime-aarch64-apple-darwin"
+  local other_python_dir="$ROOT_DIR/src-tauri/resources/python-runtime-x86_64-apple-darwin"
 
   ensure_parent "$yt_dlp_path"
 
@@ -137,6 +149,8 @@ prepare_macos_arm64() {
       "$TMP_DIR/python-macos-arm64.tar.gz"
     tar -xzf "$TMP_DIR/python-macos-arm64.tar.gz" -C "$python_dir"
   fi
+
+  ensure_placeholder_dir "$other_python_dir"
 }
 
 prepare_windows_x64() {

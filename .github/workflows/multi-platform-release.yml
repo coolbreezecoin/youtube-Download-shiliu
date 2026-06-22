@@ -22,7 +22,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact_suffix: macos-aarch64-notarized
           - label: Intel
-            runner: macos-13
+            runner: macos-15
             target: x86_64-apple-darwin
             artifact_suffix: macos-x64-notarized
     env:
@@ -45,6 +45,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Install frontend dependencies
         run: npm ci
@@ -134,6 +136,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - name: Install frontend dependencies
         run: npm ci

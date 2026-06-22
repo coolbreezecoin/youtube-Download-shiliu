@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "resources": {
+      "resources/ffmpeg-libs/": "ffmpeg-libs/",
+      "resources/ffmpeg-libs-x86_64-apple-darwin/": "ffmpeg-libs-x86_64-apple-darwin/",
+      "resources/python-runtime-aarch64-apple-darwin/": "python-runtime-aarch64-apple-darwin/",
+      "resources/python-runtime-x86_64-apple-darwin/": "python-runtime-x86_64-apple-darwin/"
+    }
+  }
+}
